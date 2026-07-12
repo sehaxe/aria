@@ -1,4 +1,4 @@
-# Aria-torch2
+# Aria
 
 1.58-bit ternary LLM in PyTorch. GDN2 recurrent attention + HelixCore + SCTLinear + FlexAttention.
 

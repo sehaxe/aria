@@ -1,4 +1,4 @@
-# PROJECT KNOWLEDGE BASE — Aria-torch2 (PyTorch)
+# PROJECT KNOWLEDGE BASE — Aria (PyTorch)
 
 **Stack:** PyTorch 2.13+cu130 · CUDA 13.0 · Triton 3.7.1 · FlexAttention · RTX 5060 Ti (sm_120, 16.7GB, 36 SMs)
 

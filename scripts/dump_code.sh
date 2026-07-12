@@ -11,7 +11,7 @@ TST="$BASE/tests"
 SCR="$BASE/scripts"
 
 {
-  echo "# Aria-torch2 — Full Source"
+  echo "# Aria — Full Source"
   echo
   src_lines=$(find "$SRC" -name '*.py' | xargs wc -l | tail -1 | awk '{print $1}')
   src_files=$(find "$SRC" -name '*.py' | wc -l)
