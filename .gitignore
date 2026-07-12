@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv*/
+venv/
+.env/
+
+# Checkpoints & data
+checkpoints/
+checkpoint.pt
+data/
+*.bin
+outputs/
+logs/
+
+# Dumps & debug
+aria-code.md
+full_source.md
+debug_*.py
+validate_arch.py
+run_cuda_graphs_test.py
+
+# Project metadata
+.pyproject-installed.lst
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# HyperFrames promo builds
+aria-promo/
+
+# Temp
+*.tmp
+.ipynb_checkpoints/
