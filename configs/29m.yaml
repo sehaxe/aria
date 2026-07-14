@@ -14,6 +14,7 @@ sct_l1: 1e-6
 batch_size: 2
 max_steps: 500
 log_every: 10
+data_path: data/pretrain/real/corpus.bin
 
 # --- Supervised factual memory (Engram) ---
 engram_vocab_size: 1048576  # 2^20 entries in the factual embedding table

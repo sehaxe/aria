@@ -214,7 +214,7 @@ def train(model, loader, opts, steps=1000, clip=1.0, sct_l1=0.0, log_every=10, u
 
 
 def train_phased(model, opts, stages_config, batch_size=4, seq_len=64, log_every=10,
-                 use_amp=True, use_cuda_graphs=False, sct_l1=0.0):
+                 use_amp=True, use_cuda_graphs=False, sct_l1=0.0, default_data_path=None):
     """Run declarative multi-stage training with dynamic dataset switching."""
     model.train()
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp) if (use_amp and not use_cuda_graphs) else None
@@ -227,7 +227,7 @@ def train_phased(model, opts, stages_config, batch_size=4, seq_len=64, log_every
         stage_engram_only = stage.get("engram_only", False)
         stage_jepa_only = stage.get("jepa_only", False)
         stage_image_prob = stage.get("image_prob", 0.5)
-        stage_data_path = stage.get("data_path", None)
+        stage_data_path = stage.get("data_path", default_data_path)
 
         # Aria-JEPA: enable world-model training in non-engram stages; in a
         # jepa_only stage the decoder is frozen and only the JEPA loss trains
@@ -242,8 +242,6 @@ def train_phased(model, opts, stages_config, batch_size=4, seq_len=64, log_every
               f"  image_prob={stage_image_prob}  data={stage_data_path or 'default'}")
         print(f"{'='*78}")
 
-        # ponytail: for now create_loader ignores data_path (synthetic generator).
-        # A real mmap ByteStreamer would read stage_data_path here.
         loader = create_loader(batch_size=batch_size, seq_len=seq_len,
                                image_prob=stage_image_prob, data_path=stage_data_path)
 

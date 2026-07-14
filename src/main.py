@@ -54,9 +54,11 @@ def run_pretrain(cfg, steps=None):
                      log_every=cfg.log_every,
                      use_cuda_graphs=cfg.use_cuda_graph,
                      sct_l1=cfg.sct_l1,
+                     default_data_path=getattr(cfg, "data_path", None),
                      use_amp=False)
     else:
-        loader = create_loader(batch_size=cfg.batch_size, seq_len=cfg.max_seq_len, image_prob=0.5)
+        loader = create_loader(batch_size=cfg.batch_size, seq_len=cfg.max_seq_len,
+                               image_prob=0.5, data_path=getattr(cfg, "data_path", None))
         train(model, loader, opts, steps=steps if steps is not None else cfg.max_steps,
               use_cuda_graphs=cfg.use_cuda_graph, use_amp=False)
     print("OK")
