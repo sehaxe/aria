@@ -37,7 +37,7 @@ def _gru_lti_fwd_kernel(
     h_cand = (1.0 - z) * n + z * hv
     h_next = av * h_cand + bv * xv
 
-    tl.store(out_ptr + base + offs_d, h_next, mask=mask)
+    tl.store(out_ptr + base + offs_d, h_next.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 @triton.jit
@@ -91,14 +91,14 @@ def _gru_lti_bwd_kernel(
     gxr = dt
     ghr = dt
 
-    tl.store(gx_ptr + base3 + 0 * D + offs_d, gxr, mask=mask)
-    tl.store(gx_ptr + base3 + 1 * D + offs_d, gxz, mask=mask)
-    tl.store(gx_ptr + base3 + 2 * D + offs_d, gxu, mask=mask)
-    tl.store(gh_ptr + base3 + 0 * D + offs_d, ghr, mask=mask)
-    tl.store(gh_ptr + base3 + 1 * D + offs_d, ghz, mask=mask)
-    tl.store(gh_ptr + base3 + 2 * D + offs_d, ghn, mask=mask)
-    tl.store(ghv_ptr + base + offs_d, ghv, mask=mask)
-    tl.store(gxv_ptr + base + offs_d, gxv, mask=mask)
+    tl.store(gx_ptr + base3 + 0 * D + offs_d, gxr.to(gx_ptr.dtype.element_ty), mask=mask)
+    tl.store(gx_ptr + base3 + 1 * D + offs_d, gxz.to(gx_ptr.dtype.element_ty), mask=mask)
+    tl.store(gx_ptr + base3 + 2 * D + offs_d, gxu.to(gx_ptr.dtype.element_ty), mask=mask)
+    tl.store(gh_ptr + base3 + 0 * D + offs_d, ghr.to(gh_ptr.dtype.element_ty), mask=mask)
+    tl.store(gh_ptr + base3 + 1 * D + offs_d, ghz.to(gh_ptr.dtype.element_ty), mask=mask)
+    tl.store(gh_ptr + base3 + 2 * D + offs_d, ghn.to(gh_ptr.dtype.element_ty), mask=mask)
+    tl.store(ghv_ptr + base + offs_d, ghv.to(ghv_ptr.dtype.element_ty), mask=mask)
+    tl.store(gxv_ptr + base + offs_d, gxv.to(gxv_ptr.dtype.element_ty), mask=mask)
 
 
 class FusedGRULTI(torch.autograd.Function):

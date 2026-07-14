@@ -41,18 +41,17 @@ class Muon(torch.optim.Optimizer):
                     bp, bq = s['buf_p'], s['buf_q']
                     gf = grad.float()
                     old_bp = bp.clone()
-                    bp.mul_(0.95).add_(gf @ bq)
-                    bq.mul_(0.95).add_(gf.T @ old_bp)
+                    bp.mul_(mom).add_(gf @ bq)
+                    bq.mul_(mom).add_(gf.T @ old_bp)
                     O = bp @ bq.T
                 else:
                     if 'buf' not in s:
                         s['buf'] = torch.zeros_like(p)
-                    s['buf'].mul_(0.95).add_(grad.to(s['buf'].dtype))
+                    s['buf'].mul_(mom).add_(grad.to(s['buf'].dtype))
                     O = s['buf']
                 d = max(p.shape) if p.ndim > 0 else 1
                 if O.ndim == 2 and base_rank >= d // 2:
                     O = ns(O.float(), steps=3).to(p.dtype)
                 else:
                     O.div_(O.norm(dim=0, keepdim=True).clamp(min=1e-8))
-                d = max(p.shape) if p.ndim > 0 else 1
                 p.mul_(1.0 - lr * wd).add_(O.to(p.dtype), alpha=-lr * 0.2 * (d ** 0.5))

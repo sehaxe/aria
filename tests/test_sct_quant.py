@@ -32,6 +32,16 @@ def test_sct_quant_forward_matches_reference():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel needs CUDA")
+def test_sct_quant_forward_bf16():
+    torch.manual_seed(0)
+    U = torch.randn(64, 32, device="cuda", dtype=torch.bfloat16)
+    for ternary in (True, False):
+        out = FusedSCTQuant.apply(U, ternary)
+        ref = ref_forward(U.to(torch.float32), ternary).to(torch.bfloat16)
+        assert torch.allclose(out, ref, atol=1e-2), (out - ref).abs().max().item()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel needs CUDA")
 def test_sct_quant_backward_matches_reference():
     torch.manual_seed(0)
     U = (torch.randn(64, 32, device="cuda") * 2.0).requires_grad_(True)

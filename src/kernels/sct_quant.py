@@ -23,7 +23,7 @@ def _sct_quant_fwd_kernel(
                          tl.where(u_clamped < -0.5, -1.0, 0.0))
     else:
         u_out = u_clamped
-    tl.store(uq_ptr + offsets, u_out, mask=mask)
+    tl.store(uq_ptr + offsets, u_out.to(uq_ptr.dtype.element_ty), mask=mask)
 
 
 @triton.jit
@@ -43,7 +43,7 @@ def _sct_quant_bwd_kernel(
     us = u / au
     inside = (us > -1.0) & (us < 1.0)
     gq = tl.where(inside, g / au, 0.0)
-    tl.store(gq_ptr + offsets, gq, mask=mask)
+    tl.store(gq_ptr + offsets, gq.to(gq_ptr.dtype.element_ty), mask=mask)
 
 
 class FusedSCTQuant(torch.autograd.Function):
