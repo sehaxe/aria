@@ -39,6 +39,8 @@ class AriaConfig:
     batch_size: int = 8
     max_steps: int = 1000
     data_path: str = "data/train.bin"
+    checkpoint_path: Optional[str] = None
+    save_every: int = 500
     max_sigma: float = 1.0
     use_grpo: bool = False
     # --- performance / experimental flags (all OFF by default) ---

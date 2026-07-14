@@ -1,4 +1,5 @@
 import argparse
+import os
 import time
 import torch
 from torch.utils.data import DataLoader
@@ -13,7 +14,7 @@ def count_params(m):
     return sum(p.numel() for p in m.parameters())
 
 
-def run_pretrain(cfg, steps=None):
+def run_pretrain(cfg, steps=None, checkpoint_path=None, save_every=500, resume_path=None, fresh=False):
     model = AriaModel(d_model=cfg.d_model, n_heads=cfg.n_heads, n_loops=cfg.n_loops,
                       rank=cfg.sct_rank, nsa=getattr(cfg, "nsa", False), nsa_every=cfg.nsa_every,
                       max_sigma=cfg.max_sigma,
@@ -55,7 +56,12 @@ def run_pretrain(cfg, steps=None):
                      use_cuda_graphs=cfg.use_cuda_graph,
                      sct_l1=cfg.sct_l1,
                      default_data_path=getattr(cfg, "data_path", None),
-                     use_amp=False)
+                     use_amp=False,
+                     clip=getattr(cfg, "clip_norm", 1.0),
+                     checkpoint_path=checkpoint_path,
+                     save_every=save_every,
+                     resume_path=resume_path,
+                     fresh=fresh)
     else:
         loader = create_loader(batch_size=cfg.batch_size, seq_len=cfg.max_seq_len,
                                image_prob=0.5, data_path=getattr(cfg, "data_path", None))
@@ -162,26 +168,26 @@ def run_grpo(cfg, steps=None, kv_cache=False):
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("config", type=str, nargs="?", default=None, help="YAML config")
-    ap.add_argument("d_model", type=int, nargs="?", default=768)
-    ap.add_argument("n_loops", type=int, nargs="?", default=6)
-    ap.add_argument("steps", type=int, nargs="?", default=20)
-    ap.add_argument("--config", dest="config_path", type=str, default=None,
-                    help="YAML config (reads use_grpo)")
+    ap = argparse.ArgumentParser(description="Aria training launcher")
+    ap.add_argument("config_path", type=str, nargs="?", default=None, help="YAML config")
     ap.add_argument("--grpo", action="store_true", help="force GRPO post-training")
+    ap.add_argument("--steps", type=int, default=None, help="override max_steps (non-phased)")
+    ap.add_argument("--checkpoint", type=str, default=None, help="explicit checkpoint path")
+    ap.add_argument("--fresh", action="store_true", help="ignore existing checkpoint, start fresh")
     args = ap.parse_args()
 
-    if args.config_path is None and args.config not in (None, 768):
-        args.config_path = args.config
     cfg = AriaConfig.from_yaml(args.config_path) if args.config_path else AriaConfig()
     use_grpo = args.grpo or getattr(cfg, "use_grpo", False)
-    steps = args.steps if args.steps != 20 else None
+    steps = args.steps
+    ckpt_path = args.checkpoint or getattr(cfg, "checkpoint_path", None)
+    resume_path = ckpt_path if (ckpt_path and os.path.exists(ckpt_path) and not args.fresh) else None
 
     if use_grpo:
         run_grpo(cfg, steps=steps, kv_cache=getattr(cfg, "kv_cache", False))
     else:
-        run_pretrain(cfg, steps=steps)
+        run_pretrain(cfg, steps=steps, checkpoint_path=ckpt_path,
+                     save_every=getattr(cfg, "save_every", 500),
+                     resume_path=resume_path, fresh=args.fresh)
 
 
 if __name__ == "__main__":

@@ -12,14 +12,23 @@ lotus_rank: 32
 clip_norm: 1.0
 sct_l1: 1e-6
 batch_size: 2
-max_steps: 19000
+max_steps: 15000
 log_every: 10
 data_path: data/pretrain/real/corpus.bin
 
+# --- Checkpointing (crash-safe 8-10h runs) ---
+# train_phased saves model weights every `save_every` steps; re-running the
+# same command auto-resumes from this file (optimizer momentum re-accrues).
+# Pass --fresh to start over.
+checkpoint_path: checkpoints/train_8h.pt
+save_every: 500
+
 # --- Supervised factual memory (Engram) ---
 # Reduced from 2^20 (1048576) to 2^18 (262144): 4x smaller table.
-# Frees ~2.4 GB VRAM (weights+opt+grad). Combined with n_loops=24 + batch=2,
-# seq_len=512 fits at ~7.7 GB (48 loops + batch 2 OOMs at 16 GB).
+# Frees ~2.4 GB VRAM (weights+opt+grad). Combined with n_loops=24 + per-stage
+# batches (engram 6 / jepa 4 / joint 3, seq_len 512) it fills ~12-13 GB of the
+# 16.7 GB card. (48 loops + batch 2 OOMs at 16 GB; gradient checkpointing keeps
+# HelixCore activations in backward so batches scale with VRAM, not 48 loops.)
 engram_vocab_size: 262144
 
 # --- Aria-JEPA ---
@@ -36,19 +45,25 @@ jepa_dropout: 0.5
 jepa_kl_coef: 0.01
 
 # --- Declarative multi-stage training (step counts calibrated for ~8-10h) ---
+# Per-stage batch_size tuned to fill the 16.7GB card (gradient checkpointing
+# keeps HelixCore activations in backward, so text-only engram/jepa stages take
+# a bigger batch than the image-mixed joint stage, which is capped for stability).
 training_stages:
   - name: "engram_factual_warmup"
     steps: 2000
     engram_only: true
     image_prob: 0.0
+    batch_size: 6
   - name: "masked_jepa_world_modeling"
     steps: 5000
     jepa_only: true
     image_prob: 0.0
+    batch_size: 4
   - name: "joint_reasoning_pretrain"
-    steps: 12000
+    steps: 8000
     engram_only: false
-    image_prob: 0.5
+    image_prob: 0.3
+    batch_size: 3
 
 # --- Technical optimizations (Blackwell) ---
 sct_kernel: true
