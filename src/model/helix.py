@@ -30,6 +30,12 @@ class _BitnetRecStep(torch.autograd.Function):
         hq, hs, hp = bitnet_int_codes(h, bits, hadamard)
         h_dq = _dequant(hq, hs, bits, hp)
         x_dq = _dequant(xq, xs, bits, xp)
+        # ponytail: _dequant reconstructs in the Hadamard basis (codes are
+        # quantized AFTER H). De-rotate so _loop_step's residual stream (loop_embs,
+        # engram_mem, LTI injection) stays in one coherent (original) basis.
+        if hadamard:
+            h_dq = _HadamardTransform.apply(h_dq)
+            x_dq = _HadamardTransform.apply(x_dq)
         ctx.helix = helix
         ctx.bits, ctx.hadamard = bits, hadamard
         ctx.hp, ctx.xp = hp, xp
@@ -53,6 +59,10 @@ class _BitnetRecStep(torch.autograd.Function):
         hq, hs, xq, xs = ctx.saved_tensors
         h_dq = _dequant(hq, hs, ctx.bits, ctx.hp).requires_grad_(True)
         x_dq = _dequant(xq, xs, ctx.bits, ctx.xp).requires_grad_(True)
+        # ponytail: mirror forward de-rotation (H reverts the Hadamard basis)
+        if ctx.hadamard:
+            h_dq = _HadamardTransform.apply(h_dq)
+            x_dq = _HadamardTransform.apply(x_dq)
         with torch.enable_grad():
             h_next, halt = helix._loop_step(h_dq, x_dq, ctx.engram_mem,
                                             ctx.step, ctx.prev_conf)
@@ -120,7 +130,8 @@ class HelixCore(nn.Module):
                  dropbp=0.0, lcsb_ratio=0.0, sct_kernel=False, sct_fp8=False, fp8_kan=False,
                   bitnet_v2=False, bitnet_act_bits=8, bitnet_hadamard=True,
                   loop_checkpoint=False, mixture_of_depths=False, mod_capacity=0.5,
-                  adaptive_loops=False, engram_vocab_size=65536):
+                   adaptive_loops=False, worldmodel_halt=False, nsa_attn=None, nsa_every=3,
+                   forecaster_loss_coef=0.1, engram_vocab_size=65536):
         super().__init__()
         self.max_loops = max_loops
         self.dim = d_model
@@ -163,6 +174,20 @@ class HelixCore(nn.Module):
         # ~0.018 at -4) to learn to early-exit within hundreds of steps.
         if adaptive_loops:
             nn.init.constant_(self.halt_predictor.bias, -2.0)
+        self.worldmodel_halt = worldmodel_halt
+        self.forecaster_loss_coef = forecaster_loss_coef
+        # B: world-model-grounded adaptive compute — an in-loop endpoint
+        # forecaster + curvature-gated halt. Fused ONLY when adaptive_loops is
+        # on, so the BLIND halt path (and non-adaptive tests) stay untouched.
+        if adaptive_loops and worldmodel_halt:
+            self.forecaster = SCTLinear(d_model, d_model, rank=rank, max_sigma=max_sigma,
+                                        sct_kernel=sct_kernel, sct_fp8=sct_fp8,
+                                        bitnet_v2=bitnet_v2, bitnet_act_bits=bitnet_act_bits,
+                                        bitnet_hadamard=bitnet_hadamard)
+            # 0 at init -> B starts identical to the existing halt_predictor,
+            # then learns to halt earlier on low-curvature (converged) states.
+            self.halt_curv_scale = nn.Parameter(torch.zeros(1))
+        self.last_forecaster_loss = torch.zeros(())
         self.lti = LTIInjection(d_model)
         self.relaxed_lora = DepthLoRA(d_model, rank=lora_rank, max_loops=max_loops)
         # loop-modulated LayerNorm (per-step learned scale/bias) -- preserved
@@ -173,6 +198,9 @@ class HelixCore(nn.Module):
         self.attn_res_norm = nn.LayerNorm(d_model)
         # Engram: conditional n-gram memory injected into the residual stream
         self.engram = DeepSeekEngram(d_model, engram_vocab_size=engram_vocab_size)
+        self.use_nsa = nsa_attn is not None
+        self.nsa_attn = nsa_attn
+        self.nsa_every = nsa_every
 
     @torch.compiler.disable
     def _loop_step(self, h, x_encoded, engram_mem, step, prev_conf):
@@ -201,7 +229,7 @@ class HelixCore(nn.Module):
         halt_prob = torch.sigmoid(self.halt_predictor(h_next))
         return h_next, halt_prob
 
-    def forward(self, x, tokens=None, max_loops=None, return_shallow_at=None):
+    def forward(self, x, tokens=None, max_loops=None, record_traj=False, compute_forecaster=True):
         B, T, D = x.shape
         max_loops = max_loops or self.max_loops
         # ponytail: engram is keyed by raw token ids + n-gram stats; static across
@@ -225,15 +253,16 @@ class HelixCore(nn.Module):
             # backward, so the between-step h_next chain is NOT retained (true 4-bit
             # memory). Costs ~2x HelixCore compute; frees ~n_loops*(B,T,D).
             return checkpoint(self._run_loop, x_encoded, engram_mem, mask, max_loops,
-                              False, return_shallow_at, use_reentrant=False)
+                              False, record_traj, compute_forecaster,
+                              use_reentrant=False)
         # ponytail: bitnet_v2 is quantization, NOT checkpointing -- do not conflate
         # them. The int-as-checkpoint (_BitnetRecStep) path is broken for multi-step
         # BPTT; use the plain path here (VRAM is fine without it -- see mod_bench).
         return self._run_loop(x_encoded, engram_mem, mask, max_loops,
-                              False, return_shallow_at)
+                              False, record_traj, compute_forecaster)
 
     def _run_loop(self, x_encoded, engram_mem, mask, max_loops, use_int_checkpoint,
-                  return_shallow_at=None):
+                  record_traj=False, compute_forecaster=True):
         """Recurrent chain + mAR.
 
         use_int_checkpoint=True -> per-step int-as-checkpoint (_BitnetRecStep +
@@ -248,16 +277,22 @@ class HelixCore(nn.Module):
         if self.bitnet_v2:
             xq, xs, xp = bitnet_int_codes(x_encoded, bits, had)
             x_dq = _dequant(xq, xs, bits, xp)
+            # ponytail: de-rotate to original basis (see _BitnetRecStep.forward)
+            if had:
+                x_dq = _HadamardTransform.apply(x_dq)
         else:
             x_dq = x_encoded
         h = x_encoded
         accumulated = torch.zeros_like(x_encoded)
         remaining_budget = torch.ones(B, T, 1, device=x_encoded.device, dtype=x_encoded.dtype)
         halt_probs = []
-        shallow_state = None
         state_codes = []  # int codes of h_next per step (tiny); replaces bf16 states_history
         self.mod_aux_loss = torch.zeros((), device=x_encoded.device, dtype=x_encoded.dtype)
+        self.last_forecaster_loss = torch.zeros((), device=x_encoded.device, dtype=x_encoded.dtype)
         halted = torch.zeros(B, T, 1, dtype=torch.bool, device=x_encoded.device)
+        b_active = self.adaptive_loops and self.worldmodel_halt
+        prev_vel = None
+        h_steps = []
 
         for step in range(max_loops):
             prev_conf = halt_probs[-1].detach() if len(halt_probs) > 0 else None
@@ -269,7 +304,9 @@ class HelixCore(nn.Module):
                     # non-adaptive). Avoids clone+gather/scatter overhead until
                     # some token actually exits early.
                     hq, hs, hp = bitnet_int_codes(h, bits, had)
-                    h_dq = _dequant(hq, hs, hp, bits)
+                    h_dq = _dequant(hq, hs, bits, hp)
+                    if had:
+                        h_dq = _HadamardTransform.apply(h_dq)
                     h_next, halt_prob = self._loop_step(h_dq, x_dq, engram_mem, step, prev_conf)
                     if not is_last:
                         halted = halt_prob > 0.5
@@ -290,6 +327,8 @@ class HelixCore(nn.Module):
                         if self.bitnet_v2:
                             hq_a, hs_a, hp_a = bitnet_int_codes(h_a, bits, had)
                             h_a = _dequant(hq_a, hs_a, bits, hp_a)
+                            if had:
+                                h_a = _HadamardTransform.apply(h_a)
                         h_next_a, halt_a = self._loop_step(h_a, x_a, em, step, pc)
                         conf = halt_a.reshape(-1, 1)
                         if is_last:
@@ -319,6 +358,8 @@ class HelixCore(nn.Module):
                 if self.bitnet_v2:
                     hq_a, hs_a, hp_a = bitnet_int_codes(h_a, bits, had)
                     h_a = _dequant(hq_a, hs_a, bits, hp_a)
+                    if had:
+                        h_a = _HadamardTransform.apply(h_a)
                 h_next_a, halt_a = self._loop_step(h_a, x_a, em, step, pc)
                 h_next_a = h_next_a.reshape(k, D)
                 halt_a = halt_a.reshape(k, 1)
@@ -338,12 +379,31 @@ class HelixCore(nn.Module):
             else:
                 hq, hs, hp = bitnet_int_codes(h, bits, had)
                 h_dq = _dequant(hq, hs, bits, hp)
+                if had:
+                    h_dq = _HadamardTransform.apply(h_dq)
                 h_next, halt_prob = self._loop_step(h_dq, x_dq, engram_mem, step, prev_conf)
                 if mask is not None:
                     h_det = h_dq + (h_next - h_dq).detach()
                     h_next = torch.where(mask[step], h_det, h_next)
                 if is_last:
                     halt_prob = torch.ones_like(halt_prob)
+            if b_active:
+                vel = h_next - h
+                if prev_vel is not None:
+                    curv = (vel - prev_vel).norm(dim=-1, keepdim=True)
+                else:
+                    curv = torch.zeros_like(h_next[..., :1])
+                # low curvature (converged) -> higher halt; scale learns from 0.
+                hl = torch.logit(halt_prob.clamp(1e-4, 1 - 1e-4)) - self.halt_curv_scale * curv
+                halt_prob = torch.sigmoid(hl)
+                prev_vel = vel.detach()
+                if self.training:
+                    h_steps.append(h_next)
+            # ponytail: 3:1 interleave — one NSA self-attention pass into the
+            # recurrent stream every `nsa_every` GDN2 steps (NSA mixes the hidden
+            # across the sequence; GDN2 stays the backbone).
+            if self.use_nsa and self.nsa_attn is not None and (step + 1) % self.nsa_every == 0:
+                h_next = h_next + self.nsa_attn(h_next)
             halt_prob = halt_prob * remaining_budget
             if self.bitnet_v2:
                 # ponytail: store h_next as int codes; accumulate keeps the exact
@@ -360,8 +420,6 @@ class HelixCore(nn.Module):
                 accumulated = accumulated + halt_prob * h_next
             remaining_budget = remaining_budget - halt_prob
             halt_probs.append(halt_prob)
-            if return_shallow_at is not None and step == (return_shallow_at - 1):
-                shallow_state = accumulated.clone()
             h = h_next
             if not self.training and (remaining_budget < 1e-6).all():
                 break
@@ -373,15 +431,27 @@ class HelixCore(nn.Module):
         if len(state_codes) > 1:
             step_logits = []
             for entry in state_codes:
-                h_s = _dequant(entry[0], entry[1], bits, entry[2]) if self.bitnet_v2 else entry
+                # ponytail: de-rotate (codes are Hadamard-basis) so the mAR pool
+                # shares the original basis with `accumulated` in final_output.
+                h_s = _HadamardTransform.apply(_dequant(entry[0], entry[1], bits, entry[2])) if self.bitnet_v2 else entry
                 n_s = self.attn_res_norm(h_s)
                 step_logits.append(torch.einsum("btd,d->bt", n_s, self.attn_res_query))
             step_w = F.softmax(torch.stack(step_logits, 0).unsqueeze(-1), dim=0)
             attn_res_accum = torch.zeros_like(x_encoded)
             for i, entry in enumerate(state_codes):
-                h_s = _dequant(entry[0], entry[1], bits, entry[2]) if self.bitnet_v2 else entry
+                # ponytail: de-rotate (codes are Hadamard-basis) so the mAR pool
+                # shares the original basis with `accumulated` in final_output.
+                h_s = _HadamardTransform.apply(_dequant(entry[0], entry[1], bits, entry[2])) if self.bitnet_v2 else entry
                 attn_res_accum = attn_res_accum + step_w[i] * h_s
             final_output = 0.5 * accumulated + 0.5 * attn_res_accum
         else:
             final_output = accumulated
-        return final_output, halt_probs, shallow_state
+        # ponytail: state_codes is the per-loop hidden trajectory [L,B,T,D];
+        # returned (only when record_traj) for Semantic Tube Prediction.
+        if b_active and self.training and compute_forecaster and len(h_steps) > 1:
+            # B aux loss: predict the converged representation from each
+            # intermediate hidden (the "where is my compute heading" signal).
+            preds = self.forecaster(torch.stack(h_steps, 0))
+            self.last_forecaster_loss = self.forecaster_loss_coef * F.mse_loss(
+                preds, final_output.detach().unsqueeze(0).expand_as(preds))
+        return final_output, halt_probs, state_codes

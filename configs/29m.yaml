@@ -1,6 +1,6 @@
 d_model: 2048
 n_heads: 32
-n_loops: 6
+n_loops: 48
 vocab_size: 16384
 sct_rank: 32
 max_seq_len: 512
@@ -18,11 +18,28 @@ log_every: 10
 # --- Supervised factual memory (Engram) ---
 engram_vocab_size: 1048576  # 2^20 entries in the factual embedding table
 
+# --- Aria-JEPA (I-JEPA masked latent prediction + Semantic Tube Prediction) ---
+jepa: true
+jepa_pred_hidden: 1024
+jepa_context_keep: 0.7
+jepa_patch_size: 8
+jepa_lambda_k: 1.0
+jepa_lambda_l: 1.0
+jepa_stp: 0.1
+jepa_vicreg_var: 1.0
+jepa_vicreg_cov: 1.0
+jepa_dropout: 0.5
+jepa_kl_coef: 0.01
+
 # --- Declarative multi-stage training ---
 training_stages:
   - name: "engram_factual_warmup"
     steps: 300
     engram_only: true
+    image_prob: 0.0
+  - name: "masked_jepa_world_modeling"
+    steps: 400
+    jepa_only: true
     image_prob: 0.0
   - name: "joint_reasoning_pretrain"
     steps: 200
@@ -37,3 +54,9 @@ use_checkpointing: false
 bitnet_v2: true
 bitnet_act_bits: 4
 bitnet_hadamard: true
+nsa: true                       # native sparse attention over recurrent hidden (SDPA/flash backend)
+nsa_every: 3                    # 3 GDN2 layers per 1 NSA (interleaved inside HelixCore)
+mtp: true                       # Multi-Token Prediction (DeepSeek-V3): 4 heads, 0.5^i decay
+mtp_k: 4
+mtp_loss_coef: 0.1
+fa4: false                     # NSA backend: SDPA flash on Blackwell; flip true only if flash-attn wheel present
