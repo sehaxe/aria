@@ -21,14 +21,17 @@ def test_reward_engine():
         "<think>x</think><resp>7</resp>", 7) - 0.7) < 1e-6
     assert eng.compute_quality_reward("7 apples") == 0.0
     assert eng.compute_format_reward("<|ref|>x") < 1.0
+    # reward-hacking guard: unclosed/prompt-only numbers must score 0
+    assert eng.compute_accuracy_counting("7", 7) == 0.0
+    assert eng.compute_accuracy_counting("<think>7", 7) == 0.0
     assert decode_byte_trajectory([256, 65, 257]) == "<think>A</think>"
 
 
 def test_grpo_step():
     dev = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = AriaModel(d_model=256, n_heads=4, n_loops=4, rank=16, nsa=False, use_cld=False)
+    model = AriaModel(d_model=256, n_heads=4, n_loops=4, rank=16, nsa=False)
     model = model.to(dev).to(torch.bfloat16)
-    ref = AriaModel(d_model=256, n_heads=4, n_loops=4, rank=16, nsa=False, use_cld=False)
+    ref = AriaModel(d_model=256, n_heads=4, n_loops=4, rank=16, nsa=False)
     ref.load_state_dict(model.state_dict())
     ref = ref.to(dev).to(torch.bfloat16).eval()
     ref.requires_grad_(False)
@@ -55,8 +58,8 @@ def test_grpo_step():
     lengths = lengths.to(dev)
     is_img = is_img.to(dev)
     with torch.no_grad():
-        _, _, full = trainer._rollout(patches, lengths, is_img)
-        rewards = trainer._reward(full, gt)
+        _, _, full, gen_bytes = trainer._rollout(patches, lengths, is_img)
+        rewards = trainer._reward(gen_bytes, gt)
     assert rewards.std().item() > 0, "degenerate group -> no GRPO signal"
 
 
