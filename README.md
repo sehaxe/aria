@@ -1,6 +1,6 @@
 # Aria
 
-1.58-bit ternary LLM in PyTorch. GDN2 recurrent attention + HelixCore + SCTLinear + FlexAttention.
+1.58-bit ternary LLM in PyTorch. GDN2 recurrent attention + HelixCore + SCTLinear.
 
 Port of the Rust/Burn `aria/` architecture with adaptive compute and recurrent state-space attention.
 
@@ -12,20 +12,19 @@ Port of the Rust/Burn `aria/` architecture with adaptive compute and recurrent s
 | GPU | Blackwell RTX 5060 Ti (sm_120, 16.7GB, 36 SMs) |
 | Kernels | Triton 3.8.0 (gdn2_scan, sct_mm) |
 | Python | 3.15.0b3 free-threaded |
-| Attention | GDN2 (delta-rule recurrent scan) + FlexAttention (AnchorBlock) |
+| Attention | GDN2 (delta-rule recurrent scan) + NSA (native sparse) |
 | Ternary | SCTLinear (1.58-bit low-rank, rank=32, STE gradients) |
 | Optimizer | Muon (LOTUS factored momentum) + AdamW |
 
 ## Architecture
 
 ```
-Input → Embed → AnchorBlock (2× FlexAttention + Wav-KAN FFN)
+Input → Embed → HelixCore (48× GDN2 + DynamicFFN/Wav-KAN + NSA interleave + gate)
          → HelixCore (48× GDN2 + KAN + gate) → Synth → Output
 ```
 
 - **GDN2** — O(D²) recurrent delta-rule scan (chunked C=64)
 - **DeepSeekEngram** — 1M-vocab factual memory (mmap-streamed, phased warmup)
-- **CLD** — contrastive shallow/deep logit subtraction (eval-only)
 - **MTP-4** — 4-head multi-token prediction (0.5^i decay)
 - **Phased Training** — declarative multi-stage config (engram warmup → joint fine-tuning)
 - **Spectral TTA** — 8-parameter test-time adaptation (lr=0.05, 3ms/step)
