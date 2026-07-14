@@ -35,8 +35,9 @@ def run_pretrain(cfg, steps=None):
                       jepa_vicreg_cov=getattr(cfg, "jepa_vicreg_cov", 1.0),
                       jepa_dropout=getattr(cfg, "jepa_dropout", 0.5),
                       jepa_kl_coef=getattr(cfg, "jepa_kl_coef", 0.01),
-                      mtp=getattr(cfg, "mtp", True), mtp_k=getattr(cfg, "mtp_k", 4),
-                      mtp_loss_coef=getattr(cfg, "mtp_loss_coef", 0.1))
+                       mtp=getattr(cfg, "mtp", True), mtp_k=getattr(cfg, "mtp_k", 4),
+                       mtp_loss_coef=getattr(cfg, "mtp_loss_coef", 0.1),
+                       loop_checkpoint=cfg.use_checkpointing)
     model = model.cuda().to(torch.bfloat16)
     print(f"Params: {count_params(model):,}")
     model.train()

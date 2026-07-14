@@ -129,12 +129,33 @@ class SCTLinear(nn.Module):
         self.s = nn.Parameter(torch.ones(rank) * s)
         self.V = nn.Parameter(torch.randn(d_out, rank) * s)
         self.gamma = nn.Parameter(torch.tensor(1.0))
+        # Cache for the ternary-quantized weights (see forward).
+        self._uq = self._vq = None
+        self._u_ver = self._vq_ver = None
 
     def forward(self, x):
         dtype = x.dtype
-        U, V = self.U.to(dtype), self.V.to(dtype)
-        s = self.s.to(dtype)
-        gamma = self.gamma.to(dtype)
+        U, V = self.U, self.V
+        s, gamma = self.s, self.gamma
+        # Cast U/V to the compute dtype once (cheap); the param version drives the cache key.
+        if U.dtype != dtype:
+            U = U.to(dtype)
+        if V.dtype != dtype:
+            V = V.to(dtype)
+        # U/V are static within a step; they only change after optimizer.step()
+        # (which bumps self.U._version / self.V._version via in-place mutation).
+        # Re-quantizing them on every call is the dominant launch overhead in
+        # training — a single SCTLinear (e.g. q_proj) runs once per HelixCore loop,
+        # so the weights were being quantized ~n_loops times per step for nothing.
+        if self._uq is None or self._u_ver != self.U._version or self._vq_ver != self.V._version:
+            self._uq = FusedSCTQuant.apply(U, self.ternary)
+            self._vq = FusedSCTQuant.apply(V, self.ternary)
+            self._u_ver, self._vq_ver = self.U._version, self.V._version
+        u_q, v_q = self._uq, self._vq
+        if s.dtype != dtype:
+            s = s.to(dtype)
+        if gamma.dtype != dtype:
+            gamma = gamma.to(dtype)
         # Parcae: hard-bind spectral norm of injected factors (s, gamma) so the
         # recurrent-core feed-through can't blow up (avoids spectral radius > 1)
         if self.max_sigma > 0:
@@ -142,10 +163,6 @@ class SCTLinear(nn.Module):
             scale = (sigma / self.max_sigma).clamp(min=1.0)
             s = s / scale
             gamma = gamma / scale
-        # ponytail: monolithic Triton quant replaces clamp + 2x where + one/zero
-        # tensor allocs; keeps the same au-mean normalization + STE grad.
-        u_q = FusedSCTQuant.apply(U, self.ternary)
-        v_q = FusedSCTQuant.apply(V, self.ternary)
         # ponytail: BitNet v2 — Hadamard + int-quant + matmul in one Function that
         # stores only the int activation codes (recomputes dequant in backward) ->
         # real VRAM win over the plain path (which save_for_backward's bf16 x).

@@ -252,9 +252,15 @@ class HelixCore(nn.Module):
             # ponytail: whole-loop checkpoint -- the recurrence is recomputed in
             # backward, so the between-step h_next chain is NOT retained (true 4-bit
             # memory). Costs ~2x HelixCore compute; frees ~n_loops*(B,T,D).
+            # ponytail: use_reentrant=True — the non-reentrant variant's
+            # determinism check false-positives on this loop (custom Triton
+            # autograd Functions + in-loop .detach()), so it raises
+            # CheckpointError despite the recompute being exact. Reentrant
+            # gives bit-identical gradients (verified vs no-checkpoint) and is
+            # the right call here since torch.compile is unavailable on Py3.15.
             return checkpoint(self._run_loop, x_encoded, engram_mem, mask, max_loops,
                               False, record_traj, compute_forecaster,
-                              use_reentrant=False)
+                              use_reentrant=True)
         # ponytail: bitnet_v2 is quantization, NOT checkpointing -- do not conflate
         # them. The int-as-checkpoint (_BitnetRecStep) path is broken for multi-step
         # BPTT; use the plain path here (VRAM is fine without it -- see mod_bench).

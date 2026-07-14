@@ -54,7 +54,12 @@ def _unpack_batch(batch):
 
 def _sct_l1(model):
     from model.sct import SCTLinear
-    modules = [m for m in model.modules() if isinstance(m, SCTLinear)]
+    # Cache the SCTLinear list on first use (it's stable for the model's lifetime);
+    # rescanning model.modules() every training step is pure overhead.
+    modules = getattr(model, "_sct_modules", None)
+    if modules is None:
+        modules = [m for m in model.modules() if isinstance(m, SCTLinear)]
+        model._sct_modules = modules
     if not modules:
         return None
     return sum(m.s.abs().sum() for m in modules)

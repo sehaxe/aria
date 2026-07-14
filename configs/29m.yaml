@@ -50,7 +50,7 @@ training_stages:
 sct_kernel: true
 sct_fp8: true
 adaptive_loops: true
-use_checkpointing: false
+use_checkpointing: true
 bitnet_v2: true
 bitnet_act_bits: 4
 bitnet_hadamard: true

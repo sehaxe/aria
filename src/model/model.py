@@ -53,7 +53,7 @@ class AriaModel(nn.Module):
                                 use_checkpointing=use_checkpointing,
                                 bitnet_v2=bitnet_v2, bitnet_act_bits=bitnet_act_bits,
                                 bitnet_hadamard=bitnet_hadamard,
-                                loop_checkpoint=loop_checkpoint,
+                                loop_checkpoint=use_checkpointing,
                                 mixture_of_depths=mixture_of_depths,
                                  mod_capacity=mod_capacity,
                                  adaptive_loops=adaptive_loops,
@@ -113,6 +113,13 @@ class AriaModel(nn.Module):
         self.jepa_dropout = jepa_dropout
 
     def forward(self, patches, patch_lengths, is_image_mask, targets=None, active_loops=None, return_halt=False, return_hidden=False):
+        # Drop cached quantized weights from the previous step so each forward
+        # builds a fresh autograd graph (reused tensors from a freed graph are
+        # unsafe). The per-loop cache in SCTLinear.forward still collapses the
+        # 48 loop re-quantizations down to one per step.
+        for m in self.modules():
+            if isinstance(m, SCTLinear):
+                m._uq = m._vq = None
         x = self.encoder(patches, is_image_mask)
         jepa_loss = None
         # Aria-JEPA world-modeling branch: dual forward (masked online + full target).
