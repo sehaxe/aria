@@ -82,13 +82,14 @@ class GRPOTrainer:
             gen_bytes = torch.stack(gen_tokens, 1)   # (B, G, 16)
             full = torch.cat([ctx_bytes, gen_bytes], 1)
         else:
+            gen_bytes = torch.empty((B, 0, 16), dtype=torch.long, device=dev)
             full = ctx_bytes
-        return gen_logp_online, gen_logp_ref, full
+        return gen_logp_online, gen_logp_ref, full, gen_bytes
 
-    def _reward(self, full, gt_data):
+    def _reward(self, gen_bytes, gt_data):
         rewards = []
-        for b in range(full.shape[0]):
-            text = decode_byte_trajectory(full[b].reshape(-1).tolist())
+        for b in range(gen_bytes.shape[0]):
+            text = decode_byte_trajectory(gen_bytes[b].reshape(-1).tolist())
             r_format = self.engine.compute_format_reward(text)
             r_quality = self.engine.compute_quality_reward(text)
             task_type = gt_data[b].get("task_type", "counting")
@@ -97,7 +98,7 @@ class GRPOTrainer:
             else:
                 r_acc = self.engine.compute_accuracy_maze(text, gt_data[b]["target"])
             rewards.append(0.2 * r_format + 0.2 * r_quality + 0.6 * r_acc)
-        return torch.tensor(rewards, device=full.device)
+        return torch.tensor(rewards, device=gen_bytes.device)
 
     def train_step(self, batch, opts, clip=1.0):
         patches, lengths, is_img, gt_data = batch
@@ -110,10 +111,10 @@ class GRPOTrainer:
 
         group_log_probs, group_ref_log_probs, group_rewards = [], [], []
         for _ in range(self.group_size):
-            lp_o, lp_r, full = self._rollout(patches, lengths, is_img, self.kv_cache)
+            lp_o, lp_r, full, gen_bytes = self._rollout(patches, lengths, is_img, self.kv_cache)
             group_log_probs.append(lp_o)
             group_ref_log_probs.append(lp_r)
-            group_rewards.append(self._reward(full, gt_data))
+            group_rewards.append(self._reward(gen_bytes, gt_data))
 
         log_probs = torch.stack(group_log_probs, 0)      # (G, B)
         ref_log_probs = torch.stack(group_ref_log_probs, 0)

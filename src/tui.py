@@ -347,6 +347,9 @@ class AriaTUI(App):
 
     # -- thinking --------------------------------------------------------
 
+    from textual import work
+
+    @work(thread=True)
     def _run_thinking(self) -> None:
         out = self.query_one("#think_out", RichLog)
         prompt = self.query_one("#prompt_input", Input).value.strip()
@@ -366,15 +369,17 @@ class AriaTUI(App):
             model, loops, device = build_think_model()
             pairs = generate(model, prompt, max_new_bytes=max_len, temp=temp,
                              max_loops=loops, device=device)
+            current_line = []
             for b, depth in pairs:
                 if not (0 <= b <= 255):
                     ch = f"<{b}>"
                 elif b == 10:
-                    out.write("")
+                    if current_line:
+                        out.write("".join(current_line))
+                        current_line = []
                     continue
                 else:
                     ch = chr(b)
-                # Color by depth: green -> amber -> red.
                 ratio = max(0.0, min(1.0, depth / max(loops, 1)))
                 if ratio < 0.5:
                     color = "green"
@@ -382,7 +387,9 @@ class AriaTUI(App):
                     color = "yellow"
                 else:
                     color = "red"
-                out.write(f"[{color}]{ch}[/{color}] [dim](depth={depth:.1f})[/dim]")
+                current_line.append(f"[{color}]{ch}[/{color}]")
+            if current_line:
+                out.write("".join(current_line))
         except Exception as e:
             out.write(f"[red]thinking failed: {type(e).__name__}: {e}[/red]")
 

@@ -77,6 +77,8 @@ class VisualPrimitivesRewardEngine:
 
         R = alpha * exp(-beta * |pred - gt| / (gt + 1))
         """
+        if "</think>" not in text_output:
+            return 0.0
         numbers = re.findall(r"\d+", text_output.split("</think>")[-1])
         if not numbers:
             return 0.0

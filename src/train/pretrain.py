@@ -220,8 +220,16 @@ def train_phased(model, opts, stages_config, batch_size=4, seq_len=64, log_every
         stage_name = stage.get("name", f"stage_{stage_idx}")
         stage_steps = stage.get("steps", 100)
         stage_engram_only = stage.get("engram_only", False)
+        stage_jepa_only = stage.get("jepa_only", False)
         stage_image_prob = stage.get("image_prob", 0.5)
         stage_data_path = stage.get("data_path", None)
+
+        # Aria-JEPA: enable world-model training in non-engram stages; in a
+        # jepa_only stage the decoder is frozen and only the JEPA loss trains
+        # the encoder/helix/predictors.
+        jepa_on = getattr(model, "jepa", None) is not None
+        model.jepa_only = bool(jepa_on and stage_jepa_only)
+        model.jepa_active = bool(jepa_on and not stage_engram_only)
 
         print(f"\n{'='*78}")
         print(f"=== [PHASED] Stage {stage_idx+1}/{len(stages_config)}: '{stage_name}' ===")
@@ -243,6 +251,14 @@ def train_phased(model, opts, stages_config, batch_size=4, seq_len=64, log_every
                     active += p.numel()
                 else:
                     p.grad = None
+            elif stage_jepa_only:
+                # Aria-JEPA world-modeling: freeze the generative decoder; train
+                # encoder + HelixCore + both predictors by the JEPA/STP loss.
+                p.requires_grad_(not ('decoder' in n))
+                if 'decoder' in n:
+                    p.grad = None
+                else:
+                    active += p.numel()
             else:
                 p.requires_grad_(True)
                 active += p.numel()
@@ -258,9 +274,13 @@ def train_phased(model, opts, stages_config, batch_size=4, seq_len=64, log_every
                 elapsed = time.time() - t0
                 tok_s = batch[0].numel() * log_every / max(0.001, elapsed)
                 mem = torch.cuda.max_memory_allocated() / 1e9
+                jaux = getattr(model, "last_jepa_aux", {}) or {}
+                jstr = ""
+                if jaux:
+                    jstr = " " + " ".join(f"{k}={v:.4f}" for k, v in jaux.items())
                 print(f"[{stage_name}] global_step {global_step} "
                       f"(phase step {step}/{stage_steps}): "
-                      f"loss={loss:.4f} tok/s={tok_s:.0f} mem={mem:.2f}GB")
+                      f"loss={loss:.4f} tok/s={tok_s:.0f} mem={mem:.2f}GB{jstr}")
                 torch.cuda.reset_peak_memory_stats()
                 t0 = time.time()
             global_step += 1

@@ -109,9 +109,11 @@ class TrainController:
         if self._stop.is_set():
             return False
         if self._pause.is_set():
-            self.status = "paused"
+            with self.lock:
+                self.status = "paused"
             self._pause.wait()
-        self.status = "running"
+        with self.lock:
+            self.status = "running"
         return True
 
     def _ckpt_path(self, step):
@@ -140,7 +142,6 @@ class TrainController:
         m = AriaModel(d_model=p["d_model"], n_heads=p["n_heads"], n_loops=p["n_loops"],
                       rank=32,
                       nsa=p.get("nsa", False),
-                      use_cld=p.get("use_cld", False),
                       compile=p.get("compile", False),
                       max_sigma=p.get("max_sigma", 1.0),
                       sct_kernel=p.get("sct_kernel", False),
@@ -237,13 +238,15 @@ class TrainController:
             else:
                 self._run_pretrain(resume)
         except Exception as e:  # surface errors in the log buffer
-            self.status = "error"
+            with self.lock:
+                self.status = "error"
             self._log(f"[ERROR] {type(e).__name__}: {e}")
             import traceback
             self._log(traceback.format_exc())
         finally:
             if self.status not in ("done", "stopped", "error"):
-                self.status = "idle"
+                with self.lock:
+                    self.status = "idle"
 
     def _run_pretrain(self, resume):
         from data.dataset import create_loader
@@ -256,7 +259,8 @@ class TrainController:
         loader = create_loader(batch_size=p["batch_size"], seq_len=p["seq_len"],
                                image_prob=p["image_prob"])
         start = self._load_latest(model, opts) if resume else 0
-        self.step, self.total_steps = start, p["steps"]
+        with self.lock:
+            self.step, self.total_steps = start, p["steps"]
         model.train()
         self._log(f"[pretrain] d_model={p['d_model']} n_loops={p['n_loops']} "
                   f"params={sum(x.numel() for x in model.parameters()):,}")
@@ -265,7 +269,8 @@ class TrainController:
         for step in range(start, p["steps"]):
             if not self._spin():
                 self._save(model, opts, self.step)
-                self.status = "stopped"
+                with self.lock:
+                    self.status = "stopped"
                 self._log("[pretrain] stopped by user")
                 return
             patches, lengths, is_img = next(it)
@@ -288,7 +293,8 @@ class TrainController:
                 el = time.time() - t0
                 tok_s = patches.numel() / max(0.001, el)
                 mem = torch.cuda.max_memory_allocated() / 1e9
-                self.step = step + 1
+                with self.lock:
+                    self.step = step + 1
                 self._log(f"step {step}: loss={float(loss.detach()):.4f} tok/s={tok_s:.0f} mem={mem:.2f}GB")
                 self._add_metric(step, float(loss.detach()), tok_s, mem)
                 torch.cuda.reset_peak_memory_stats()
@@ -296,7 +302,8 @@ class TrainController:
             if (step + 1) % p["ckpt_every"] == 0:
                 self._save(model, opts, step + 1)
         self._save(model, opts, p["steps"])
-        self.status = "done"
+        with self.lock:
+            self.status = "done"
         self._log("[pretrain] complete")
 
     def _synthetic_grpo_samples(self, n):
@@ -327,7 +334,8 @@ class TrainController:
         loader = DataLoader(ds, batch_size=p["batch_size"], collate_fn=collate_grpo_fn)
         trainer = GRPOTrainer(model, ref, group_size=4, beta=0.04, temperature=1.0)
         start = self._load_latest(model, opts) if resume else 0
-        self.step, self.total_steps = start, p["steps"]
+        with self.lock:
+            self.step, self.total_steps = start, p["steps"]
         model.train()
         self._log(f"[grpo] d_model={p['d_model']} n_loops={p['n_loops']} "
                   f"params={sum(x.numel() for x in model.parameters()):,}")
@@ -344,7 +352,8 @@ class TrainController:
             el = time.time() - t0
             tok_s = batch[0].numel() / max(0.001, el)
             mem = torch.cuda.max_memory_allocated() / 1e9
-            self.step = step + 1
+            with self.lock:
+                self.step = step + 1
             self._log(f"grpo step {step}: loss={loss:.4f} tok/s={tok_s:.0f} mem={mem:.2f}GB")
             self._add_metric(step, loss, tok_s, mem)
             torch.cuda.reset_peak_memory_stats()
@@ -352,5 +361,6 @@ class TrainController:
             if (step + 1) % p["ckpt_every"] == 0:
                 self._save(model, opts, step + 1)
         self._save(model, opts, p["steps"])
-        self.status = "done"
+        with self.lock:
+            self.status = "done"
         self._log("[grpo] complete")
