@@ -36,7 +36,7 @@ class _SCTMM(torch.autograd.Function):
         hs = h * s
         dz = grad_out * gamma
         z = (hs @ v.T)
-        dx = (g @ v) @ u.T                          # = dhs@u.T, dhs = g@v
+        dx = ((g @ v) * s) @ u.T                     # = dhs@u.T, dhs = g@v; dh = dhs*s
         du = x.T @ (g @ v) * s                       # = x.T @ dh, dh = dhs*s
         ds = ((g @ v) * h).sum(0)
         dv = g.T @ hs
@@ -95,7 +95,7 @@ class _BitnetSCTMM(torch.autograd.Function):
         h = deq @ u
         hs = h * s
         z = (hs @ v.T)
-        dx = (g @ v) @ u.T
+        dx = ((g @ v) * s) @ u.T
         du = deq.T @ (g @ v) * s
         ds = ((g @ v) * h).sum(0)
         dv = g.T @ hs
@@ -193,7 +193,7 @@ class _Fp8SCTMM(torch.autograd.Function):
         g = grad_out.reshape(-1, grad_out.shape[-1]) * gamma   # dL/dz, z = ((x@u)*s)@v^T
         h = x @ u
         hs = h * s
-        dx = (g @ v) @ u.T                          # = dhs@u.T, dhs = g@v
+        dx = ((g @ v) * s) @ u.T                     # = dhs@u.T, dhs = g@v; dh = dhs*s
         du = x.T @ (g @ v) * s                       # = x.T @ dh, dh = dhs*s
         ds = ((g @ v) * h).sum(0)
         dv = g.T @ hs

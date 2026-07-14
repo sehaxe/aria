@@ -406,10 +406,14 @@ class HelixCore(nn.Module):
                 h_next = h_next + self.nsa_attn(h_next)
             halt_prob = halt_prob * remaining_budget
             if self.bitnet_v2:
-                # ponytail: store h_next as int codes; accumulate keeps the exact
-                # bf16 forward value but frees the bf16 tensor (codes kept instead).
+                # ponytail: store h_next dequantized back to the ORIGINAL basis (not
+                # the int tuple) so JEPA's semantic_tube can torch.stack the
+                # trajectory; mAR below reads it directly without re-dequantizing.
                 hq, hs, hp = bitnet_int_codes(h_next, bits, had)
-                state_codes.append((hq, hs, hp))
+                h_next_dq = _dequant(hq, hs, bits, hp)
+                if had:
+                    h_next_dq = _HadamardTransform.apply(h_next_dq)
+                state_codes.append(h_next_dq)
                 if use_int_checkpoint:
                     accumulated = _BitnetAccumulate.apply(
                         accumulated, halt_prob, h_next, hq, hs, hp, bits, had)
@@ -431,18 +435,12 @@ class HelixCore(nn.Module):
         if len(state_codes) > 1:
             step_logits = []
             for entry in state_codes:
-                # ponytail: de-rotate (codes are Hadamard-basis) so the mAR pool
-                # shares the original basis with `accumulated` in final_output.
-                h_s = _HadamardTransform.apply(_dequant(entry[0], entry[1], bits, entry[2])) if self.bitnet_v2 else entry
-                n_s = self.attn_res_norm(h_s)
+                n_s = self.attn_res_norm(entry)
                 step_logits.append(torch.einsum("btd,d->bt", n_s, self.attn_res_query))
             step_w = F.softmax(torch.stack(step_logits, 0).unsqueeze(-1), dim=0)
             attn_res_accum = torch.zeros_like(x_encoded)
             for i, entry in enumerate(state_codes):
-                # ponytail: de-rotate (codes are Hadamard-basis) so the mAR pool
-                # shares the original basis with `accumulated` in final_output.
-                h_s = _HadamardTransform.apply(_dequant(entry[0], entry[1], bits, entry[2])) if self.bitnet_v2 else entry
-                attn_res_accum = attn_res_accum + step_w[i] * h_s
+                attn_res_accum = attn_res_accum + step_w[i] * entry
             final_output = 0.5 * accumulated + 0.5 * attn_res_accum
         else:
             final_output = accumulated

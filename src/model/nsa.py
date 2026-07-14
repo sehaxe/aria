@@ -59,18 +59,20 @@ class NSAAttention(nn.Module):
                                   sct_kernel=sct_kernel, sct_fp8=sct_fp8, **bitnet)
         self.rope = RotaryEmbedding(d_model // n_q_heads)
 
-    def _attn(self, q, k, v):
+    def _attn(self, q, k, v, attn_mask=None):
         # q,k,v are (B, H, S, dh). flash-attn-4 wants (B, S, H, dh) and returns a tuple.
         # FA4 is parity (not faster) vs SDPA's flash backend on Blackwell, but the
         # flag is wired for real where the wheel exists (cp314t); SDPA otherwise.
-        if self.fa4:
+        # A custom (blockwise-causal) mask can't be expressed by FA4's plain-causal
+        # flag, so we fall back to SDPA whenever a mask is supplied.
+        if self.fa4 and attn_mask is None:
             try:
                 from flash_attn.cute import flash_attn_func
                 ql, kl, vl = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
-                return flash_attn_func(ql, kl, vl, causal=False)[0].transpose(1, 2)
+                return flash_attn_func(ql, kl, vl, causal=True)[0].transpose(1, 2)
             except Exception:
                 pass
-        return F.scaled_dot_product_attention(q, k, v)
+        return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
 
     def compress(self, states, mlp, norm):
         B, H, T, dh = states.shape
@@ -101,11 +103,24 @@ class NSAAttention(nn.Module):
         cv_exp = cv.unsqueeze(2).expand(B, hkv, hq // max(hkv, 1), n_cmp, dh).reshape(B, hq, n_cmp, dh)
         qf = q.reshape(B, hq, T, dh)
 
-        o_cmp = self._attn(qf, ck_exp, cv_exp).transpose(1, 2).reshape(B, T, D)
+        # Blockwise-causal masks: a query at position i may attend a selected/
+        # compressed key only if that key's original position <= i (autoregressive;
+        # no future leakage). SDPA treats a True mask entry as *masked-out*, so we
+        # mark the future as True and use a float -inf additive mask (so a query
+        # with no valid past key — e.g. position 0 — gets a zero, not NaN).
+        INF = float("-inf")
+        qpos = torch.arange(T, device=x.device)
+        bs_cmp = min(self.block_size, T)
+        cmp_end = torch.min(torch.arange(1, n_cmp + 1, device=x.device) * bs_cmp - 1,
+                            torch.tensor(T - 1, device=x.device, dtype=torch.long))
+        cmp_keep = qpos.unsqueeze(1) >= cmp_end.unsqueeze(0)   # True where attended
+        cmp_mask = torch.where(cmp_keep, torch.zeros((), device=x.device, dtype=torch.float32),
+                               torch.full((), INF, device=x.device, dtype=torch.float32))
+        o_cmp = self._attn(qf, ck_exp, cv_exp, attn_mask=cmp_mask).transpose(1, 2).reshape(B, T, D)
 
         top_n = min(self.sel_top_n, n_cmp * 2)
         sel_bs = self.sel_block_size
-        sel_k, sel_v = [], []
+        sel_k, sel_v, sel_pos = [], [], []
         sink = min(2, n_cmp)
         for i in range(sink):
             start = min(i * self.block_size, max(0, T - sel_bs))
@@ -113,6 +128,7 @@ class NSAAttention(nn.Module):
             if length > 0:
                 sel_k.append(k[:, :, start:start + length])
                 sel_v.append(v[:, :, start:start + length])
+                sel_pos.append(torch.arange(start, start + length, device=x.device))
         step = max(1, min((n_cmp - sink), top_n - sink, 1))
         for i in range(sink, n_cmp, step):
             if len(sel_k) >= top_n: break
@@ -121,6 +137,7 @@ class NSAAttention(nn.Module):
             if length > 0:
                 sel_k.append(k[:, :, start:start + length])
                 sel_v.append(v[:, :, start:start + length])
+                sel_pos.append(torch.arange(start, start + length, device=x.device))
         local_start = max(0, T - self.window_size)
         for i in range(max(1, (T - local_start + sel_bs - 1) // sel_bs)):
             if len(sel_k) >= top_n: break
@@ -129,18 +146,27 @@ class NSAAttention(nn.Module):
             if length > 0:
                 sel_k.append(k[:, :, start:start + length])
                 sel_v.append(v[:, :, start:start + length])
+                sel_pos.append(torch.arange(start, start + length, device=x.device))
         if not sel_k:
             sel_k.append(k[:, :, :1])
             sel_v.append(v[:, :, :1])
+            sel_pos.append(torch.zeros(1, dtype=torch.long, device=x.device))
         sk = torch.cat(sel_k, dim=2)
         sv = torch.cat(sel_v, dim=2)
         g = hq // max(hkv, 1)
         sk = sk.view(B, hkv, 1, -1, dh).expand(B, hkv, g, -1, dh).reshape(B, hq, -1, dh)
         sv = sv.view(B, hkv, 1, -1, dh).expand(B, hkv, g, -1, dh).reshape(B, hq, -1, dh)
 
-        o_sel = self._attn(qf, sk, sv).transpose(1, 2).reshape(B, T, D)
+        sel_pos_flat = torch.cat(sel_pos)
+        sel_keep = qpos.unsqueeze(1) >= sel_pos_flat.unsqueeze(0)   # True where attended
+        sel_mask = torch.where(sel_keep, torch.zeros((), device=x.device, dtype=torch.float32),
+                               torch.full((), INF, device=x.device, dtype=torch.float32))
+        o_sel = self._attn(qf, sk, sv, attn_mask=sel_mask).transpose(1, 2).reshape(B, T, D)
 
-        gf = (o_cmp + o_sel).mean(dim=1, keepdim=True)
+        # Per-position gate: gf must depend ONLY on this position's own
+        # o_cmp/o_sel. A sequence mean here (the original code) injects future
+        # context into every position's gate and breaks causality.
+        gf = o_cmp + o_sel
         gates = torch.sigmoid(self.gate_mlp(gf))
         out = o_cmp * gates + o_sel * (1 - gates)
         return self.o_proj(out)

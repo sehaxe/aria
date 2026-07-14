@@ -110,6 +110,7 @@ class AriaModel(nn.Module):
         self.jepa_vicreg_cov = jepa_vicreg_cov
         self.jepa_stp = jepa_stp
         self.jepa_kl_coef = jepa_kl_coef
+        self.jepa_dropout = jepa_dropout
 
     def forward(self, patches, patch_lengths, is_image_mask, targets=None, active_loops=None, return_halt=False, return_hidden=False):
         x = self.encoder(patches, is_image_mask)
@@ -136,7 +137,10 @@ class AriaModel(nn.Module):
         """I-JEPA dual forward: predict masked target reps from context; STP on trajectory."""
         target_mask, keep, C, T = self.jepa.build_context_mask(patches, is_image_mask, patch_lengths)
         if target_mask.sum() == 0:
-            return torch.zeros((), device=x.device), {}
+            # No masked positions this batch: return a graph-connected zero so
+            # backward (incl. jepa_only) is a harmless no-op instead of a detached
+            # constant that silently kills the JEPA gradient.
+            return (self.mask_emb * 0).sum(), {}
         # online (masked context) forward — carries gradient + trajectory
         _, _, _, h_online, traj_online = self.run_encoded(x, patches, is_image_mask,
                                                   active_loops=active_loops,
