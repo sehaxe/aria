@@ -202,7 +202,6 @@ class HelixCore(nn.Module):
         self.nsa_attn = nsa_attn
         self.nsa_every = nsa_every
 
-    @torch.compiler.disable
     def _loop_step(self, h, x_encoded, engram_mem, step, prev_conf):
         h_cond = h + self.loop_embs[step].to(h.dtype)
         # engram_mem is precomputed once in forward() (static across the loop)
@@ -404,7 +403,7 @@ class HelixCore(nn.Module):
                 halt_prob = torch.sigmoid(hl)
                 prev_vel = vel.detach()
                 if self.training:
-                    h_steps.append(h_next)
+                    h_steps.append(h_next.clone())
             # ponytail: 3:1 interleave — one NSA self-attention pass into the
             # recurrent stream every `nsa_every` GDN2 steps (NSA mixes the hidden
             # across the sequence; GDN2 stays the backbone).

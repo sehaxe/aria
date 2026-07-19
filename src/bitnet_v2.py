@@ -29,18 +29,24 @@ _HADAMARD_CACHE = {}
 
 
 def _hadamard_matrix(n, device, dtype):
-    """Normalized Sylvester Hadamard (n x n, entries ±1/sqrt(n)), n = 2^m."""
-    if (n, str(device), dtype) in _HADAMARD_CACHE:
-        return _HADAMARD_CACHE[(n, str(device), dtype)]
-    # ponytail: build on CPU, cache per (n, device, dtype)
+    """Normalized Sylvester Hadamard (n x n, entries ±1/sqrt(n)), n = 2^m.
+
+    Cached per (n, dtype) on CPU; the caller moves to the right device outside
+    the compiled graph (autograd.Function is a graph break, so .to() there is
+    safe). allow_in_graph keeps this a black box for Dynamo — no device-object
+    dict keys, no in-graph .to() confusing fake-tensor mode.
+    """
+    if (n, dtype) in _HADAMARD_CACHE:
+        return _HADAMARD_CACHE[(n, dtype)]
+    # ponytail: build on CPU, cache per (n, dtype)
     def build(k):
         if k == 1:
             return torch.tensor([[1.0]], dtype=torch.float32)
         h = build(k // 2)
         return torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0) / math.sqrt(2)
     H = build(n)      # ponytail: repeated /sqrt(2) already normalizes entries to ±1/sqrt(n)
-    H = H.to(device=device, dtype=dtype)
-    _HADAMARD_CACHE[(n, str(device), dtype)] = H
+    H = H.to(dtype=dtype)
+    _HADAMARD_CACHE[(n, dtype)] = H
     return H
 
 
@@ -66,7 +72,7 @@ class _HadamardTransform(torch.autograd.Function):
         flat = x.reshape(-1, D)
         if P != D:
             flat = F.pad(flat, (0, P - D))
-        H = _hadamard_matrix(P, x.device, x.dtype)
+        H = _hadamard_matrix(P, x.device, x.dtype).to(x.device)
         out = flat @ H.T
         # ponytail: return the unpadded dim so the activation keeps x's shape
         return out.reshape(*x.shape[:-1], P)[..., :D]
@@ -74,7 +80,7 @@ class _HadamardTransform(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         P, D = ctx.P, ctx.D
-        H = _hadamard_matrix(P, grad.device, grad.dtype)
+        H = _hadamard_matrix(P, grad.device, grad.dtype).to(grad.device)
         flat = grad.reshape(-1, D)
         if P != D:
             flat = F.pad(flat, (0, P - D))   # pad to match the H multiply

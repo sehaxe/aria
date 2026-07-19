@@ -1,0 +1,70 @@
+d_model: 2048
+n_heads: 32
+n_loops: 24
+vocab_size: 16384
+sct_rank: 32
+max_seq_len: 512
+lr_muon: 0.0005
+lr_adamw: 0.0001
+wd_muon: 0.2
+wd_adamw: 0.05
+lotus_rank: 32
+clip_norm: 1.0
+sct_l1: 1e-6
+batch_size: 2
+max_steps: 300
+log_every: 10
+data_path: data/pretrain/real/corpus.bin
+
+# --- Checkpointing (benchmark: disable saving) ---
+checkpoint_path: checkpoints/_bench.pt
+save_every: 100000
+
+# --- Supervised factual memory (Engram) ---
+engram_vocab_size: 262144
+
+# --- Aria-JEPA ---
+jepa: true
+jepa_pred_hidden: 1024
+jepa_context_keep: 0.7
+jepa_patch_size: 8
+jepa_lambda_k: 1.0
+jepa_lambda_l: 1.0
+jepa_stp: 0.1
+jepa_vicreg_var: 1.0
+jepa_vicreg_cov: 1.0
+jepa_dropout: 0.5
+jepa_kl_coef: 0.01
+
+# --- Declarative multi-stage training (benchmark: 100/100/100 = 300 steps) ---
+training_stages:
+  - name: "engram_factual_warmup"
+    steps: 80
+    engram_only: true
+    image_prob: 0.0
+    batch_size: 6
+  - name: "masked_jepa_world_modeling"
+    steps: 80
+    jepa_only: true
+    image_prob: 0.0
+    batch_size: 4
+  - name: "joint_reasoning_pretrain"
+    steps: 80
+    engram_only: false
+    image_prob: 0.3
+    batch_size: 3
+
+# --- Technical optimizations (Blackwell) ---
+sct_kernel: true
+sct_fp8: true
+adaptive_loops: true
+use_checkpointing: true
+bitnet_v2: true
+bitnet_act_bits: 4
+bitnet_hadamard: true
+nsa: true
+nsa_every: 3
+mtp: true
+mtp_k: 4
+mtp_loss_coef: 0.1
+fa4: false

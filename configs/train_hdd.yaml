@@ -1,0 +1,81 @@
+d_model: 2048
+n_heads: 32
+n_loops: 24
+vocab_size: 16384
+sct_rank: 32
+max_seq_len: 512
+lr_muon: 0.0005
+lr_adamw: 0.0001
+wd_muon: 0.2
+wd_adamw: 0.05
+lotus_rank: 32
+clip_norm: 1.0
+sct_l1: 1e-6
+batch_size: 2
+max_steps: 15000
+log_every: 10
+data_path: /mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/aria_data/pretrain/real/corpus.bin
+
+# --- Checkpointing (crash-safe 8-10h runs) ---
+# train_phased saves model weights every `save_every` steps; re-running the
+# same command auto-resumes from this file (optimizer momentum re-accrues).
+# Pass --fresh to start over.
+checkpoint_path: /mnt/e43497ab-0ff2-45b4-b45f-28de3339a53e/aria_data/checkpoints/train_8h.pt
+save_every: 500
+
+# --- Supervised factual memory (Engram) ---
+# Reduced from 2^20 (1048576) to 2^18 (262144): 4x smaller table.
+# Frees ~2.4 GB VRAM (weights+opt+grad). Combined with n_loops=24 + per-stage
+# batches (engram 6 / jepa 4 / joint 3, seq_len 512) it fills ~12-13 GB of the
+# 16.7 GB card. (48 loops + batch 2 OOMs at 16 GB; gradient checkpointing keeps
+# HelixCore activations in backward so batches scale with VRAM, not 48 loops.)
+engram_vocab_size: 262144
+
+# --- Aria-JEPA ---
+jepa: true
+jepa_pred_hidden: 1024
+jepa_context_keep: 0.7
+jepa_patch_size: 8
+jepa_lambda_k: 1.0
+jepa_lambda_l: 1.0
+jepa_stp: 0.1
+jepa_vicreg_var: 1.0
+jepa_vicreg_cov: 1.0
+jepa_dropout: 0.5
+jepa_kl_coef: 0.01
+
+# --- Declarative multi-stage training (step counts calibrated for ~8-10h) ---
+# Per-stage batch_size tuned to fill the 16.7GB card (gradient checkpointing
+# keeps HelixCore activations in backward, so text-only engram/jepa stages take
+# a bigger batch than the image-mixed joint stage, which is capped for stability).
+training_stages:
+  - name: "engram_factual_warmup"
+    steps: 2000
+    engram_only: true
+    image_prob: 0.0
+    batch_size: 6
+  - name: "masked_jepa_world_modeling"
+    steps: 5000
+    jepa_only: true
+    image_prob: 0.0
+    batch_size: 4
+  - name: "joint_reasoning_pretrain"
+    steps: 8000
+    engram_only: false
+    image_prob: 0.3
+    batch_size: 3
+
+# --- Technical optimizations (Blackwell) ---
+sct_kernel: true
+sct_fp8: true
+adaptive_loops: true
+use_checkpointing: true
+bitnet_v2: true
+bitnet_act_bits: 4
+bitnet_hadamard: true
+nsa: true
+nsa_every: 3
+mtp: true
+mtp_k: 4
+mtp_loss_coef: 0.1
+fa4: false

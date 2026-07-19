@@ -336,7 +336,9 @@ def train_phased(model, opts, stages_config, batch_size=4, seq_len=64, log_every
                 elapsed = time.time() - t0
                 dt = elapsed / max(1, log_every)
                 ema_dt = dt if ema_dt is None else 0.9 * ema_dt + 0.1 * dt
-                tok_s = batch[0].numel() * log_every / max(0.001, elapsed)
+                # Real token throughput: B*T patches (not B*T*768 patch-dim).
+                nb, nt = batch[0].shape[0], batch[0].shape[1]
+                tok_s = nb * nt * log_every / max(0.001, elapsed)
                 mem = torch.cuda.max_memory_allocated() / 1e9
                 remaining = total_steps - global_step
                 eta = _fmt_eta(remaining * ema_dt)

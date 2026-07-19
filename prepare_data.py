@@ -6,44 +6,42 @@ Usage:
 """
 import os, sys, random
 from pathlib import Path
-import numpy as np
 
 
 def pack_text_folder_to_bin(input_dir, output_bin_path):
-    print(f"Scanning {input_dir} for .txt / .json / .md ...")
     files = (
         list(Path(input_dir).rglob("*.txt"))
         + list(Path(input_dir).rglob("*.json"))
         + list(Path(input_dir).rglob("*.md"))
     )
+    files = [f for f in files if f.stat().st_size > 0]
     if not files:
         print(f"No text files found in {input_dir}")
         return
 
-    documents = []
-    for f in files:
-        try:
-            text = f.read_text("utf-8", errors="replace").strip()
-            if text:
-                documents.append(text)
-        except Exception as e:
-            print(f"  skip {f.name}: {e}")
-
-    print(f"Documents: {len(documents):,}, shuffling ...")
-    random.shuffle(documents)
+    # ponytail: shuffle file order (each file = one ~6MB chunk), never the
+    # contents, so RAM stays at O(one chunk) instead of O(corpus). Stream write.
+    random.shuffle(files)
 
     os.makedirs(Path(output_bin_path).parent, exist_ok=True)
     sep = b"\n"
     size = 0
     with open(output_bin_path, "wb") as out:
-        for doc in documents:
-            data = doc.encode("utf-8")
+        for f in files:
+            try:
+                data = f.read_bytes()
+            except Exception as e:
+                print(f"  skip {f.name}: {e}")
+                continue
+            if not data:
+                continue
+            if data[-1:] != sep:
+                data += sep
             out.write(data)
-            out.write(sep)
-            size += len(data) + len(sep)
+            size += len(data)
 
-    gb = size / (1024**3)
-    print(f"Written: {output_bin_path}  ({size:,} bytes = {gb:.2f} GB)")
+    gb = size / (1024 ** 3)
+    print(f"Written: {output_bin_path}  ({size:,} bytes = {gb:.2f} GB)  from {len(files):,} files")
 
 
 if __name__ == "__main__":

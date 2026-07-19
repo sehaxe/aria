@@ -1,19 +1,18 @@
-"""Aria Control Room — Textual TUI replacement for the Gradio ui.
+"""Aria Control Room — Textual TUI for training & recurrent thinking.
 
-Drives train.controller.TrainController and (lazily) the recurrent-thinking
-inference path from think.py. Fully Gradio-free; the Thinking tab pulls only
-torch + PyYAML via think.build_think_model / think.generate.
+Gradio-free dashboard driving train.controller.TrainController and (lazily)
+the thinking path from think.py. Live loss / tok-s sparklines, a breathing
+status badge, and a thinking-depth meter.
 
 Tabs:
-  Training  — Start / Pause / Stop / Load 29m; live status badge, progress
-              bar, metrics card; RichLog polled ~0.5s from ctrl.get_logs() +
-              ctrl.get_metrics().
-  Thinking  — Prompt -> generate -> RichLog with per-token thinking depth.
+  Training  — Start / Pause / Stop / Load 29m; status badge + progress,
+              colored metrics, live loss & throughput sparklines, log feed.
+  Thinking  — Prompt -> generate -> streamed output colored by thinking depth,
+              with a live depth meter.
   Config    — Read-only view of configs/29m.yaml.
 
 Bindings: q=quit, s=start, p=pause/resume toggle, x=stop.
 """
-import os
 import sys
 from pathlib import Path
 
@@ -23,6 +22,7 @@ _SRC = Path(__file__).resolve().parent
 if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
+from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -34,6 +34,7 @@ from textual.widgets import (
     Label,
     ProgressBar,
     RichLog,
+    Sparkline,
     Static,
     TabbedContent,
     TabPane,
@@ -44,37 +45,45 @@ from train.controller import TrainController
 
 CONFIG_PATH = str(_SRC.parent / "configs" / "29m.yaml")
 
-# Textual CSS: NO text-shadow (unsupported). Dark bg, teal/amber/red accents.
 ARIA_CSS = """
 Screen {
-    background: #070b10;
-    color: #d7e0ea;
+    background: #060a0f;
+    color: #cdd9e5;
 }
 
 Header {
-    background: #0c1219;
+    background: #0b121b;
     color: #2dd4bf;
     text-style: bold;
 }
 
 Footer {
-    background: #0c1219;
+    background: #0b121b;
     color: #6b7c8c;
 }
 
 TabbedContent {
-    background: #070b10;
+    background: #060a0f;
 }
 
 TabPane {
     padding: 1 2;
 }
 
-.card {
-    background: #0c1219;
-    border: round #1e2a38;
+.hero {
+    background: #0b121b;
+    border: round #16344a;
+    color: #2dd4bf;
+    text-align: center;
     padding: 1 2;
     margin: 0 0 1 0;
+}
+
+.card {
+    background: #0b121b;
+    border: round #1b2a3a;
+    padding: 1 2;
+    margin: 0 1 1 0;
 }
 
 .card-title {
@@ -87,10 +96,11 @@ TabPane {
     color: #6b7c8c;
     text-style: bold;
     padding: 0 2;
+    margin: 0 0 1 0;
 }
 
-#status_badge.-running { color: #2dd4bf; }
-#status_badge.-paused  { color: #ff8a3d; }
+#status_badge.-running { color: #2dd4bf; text-style: bold; }
+#status_badge.-paused  { color: #ff8a3d; text-style: bold; }
 #status_badge.-stopped { color: #ff5c5c; }
 #status_badge.-error   { color: #ff5c5c; text-style: bold reverse; }
 #status_badge.-done    { color: #34e89e; }
@@ -127,25 +137,45 @@ Button.-danger {
     border: tall #5a1f1f;
 }
 
+#metrics {
+    height: auto;
+    margin: 1 0;
+}
+
+#loss_spark {
+    color: #ff8a3d;
+    height: 5;
+}
+
+#tps_spark {
+    color: #2dd4bf;
+    height: 5;
+}
+
+.spark-label {
+    color: #6b7c8c;
+    width: 9;
+}
+
 #logs, #think_out, #cfg_view {
-    background: #070b10;
-    border: round #1e2a38;
+    background: #070d13;
+    border: round #1b2a3a;
     height: 100%;
     min-height: 12;
 }
 
-#metrics_card {
-    height: auto;
+#depth_meter {
+    margin: 1 0;
 }
 
-.metric-line {
-    color: #d7e0ea;
+ProgressBar#depth_meter > Bar {
+    color: #ff8a3d;
 }
 
 Input {
-    background: #070b10;
-    border: round #1e2a38;
-    color: #d7e0ea;
+    background: #070d13;
+    border: round #1b2a3a;
+    color: #cdd9e5;
 }
 
 Label {
@@ -177,8 +207,8 @@ class AriaTUI(App):
     """Aria Control Room — Textual dashboard."""
 
     CSS = ARIA_CSS
-    TITLE = "ARIA CONTROL ROOM"
-    SUB_TITLE = "recurrent ternary LLM · training & thinking console"
+    TITLE = "ARIA"
+    SUB_TITLE = "recurrent ternary LLM · control room"
 
     BINDINGS = [
         Binding("q", "quit", "Quit"),
@@ -192,10 +222,15 @@ class AriaTUI(App):
         self.ctrl = TrainController(ckpt_dir=str(_SRC.parent / "checkpoints"))
         self._last_log_len = 0
         self._last_metric_step = -1
+        self._loss_hist: list[float] = []
+        self._tps_hist: list[float] = []
+        self._pulse_state = 1.0
         self._logs_widget: RichLog | None = None
         self._metrics_widget: Static | None = None
         self._status_widget: Static | None = None
         self._progress_widget: ProgressBar | None = None
+        self._loss_spark: Sparkline | None = None
+        self._tps_spark: Sparkline | None = None
 
     # -- compose ---------------------------------------------------------
 
@@ -211,20 +246,30 @@ class AriaTUI(App):
         yield Footer()
 
     def _compose_training(self) -> ComposeResult:
+        yield Static(
+            "[bold #2dd4bf]ARIA[/bold #2dd4bf] · [bold]CONTROL ROOM[/bold]\n"
+            "[dim]recurrent ternary LLM — training & thinking console[/dim]",
+            id="hero", classes="hero", markup=True,
+        )
         with Horizontal():
             with Vertical(classes="card"):
                 yield Static("CONTROL", classes="card-title")
                 yield Static("● IDLE", id="status_badge", classes="-idle")
                 yield ProgressBar(total=100, id="progress", show_eta=False)
                 with Horizontal():
-                    yield Button("▶ Start",     id="btn_start",  classes="-primary")
-                    yield Button("⏸ Pause",     id="btn_pause",  classes="-heat")
-                    yield Button("■ Stop",      id="btn_stop",   classes="-danger")
-                    yield Button("⚙ Load 29m",  id="btn_load29")
-            with Vertical(classes="card", id="metrics_card"):
+                    yield Button("▶ Start",    id="btn_start",  classes="-primary")
+                    yield Button("⏸ Pause",    id="btn_pause",  classes="-heat")
+                    yield Button("■ Stop",     id="btn_stop",   classes="-danger")
+                    yield Button("⚙ Load 29m", id="btn_load29")
+            with Vertical(classes="card"):
                 yield Static("LIVE METRICS", classes="card-title")
-                yield Static("step —  loss —  tok/s —  mem —",
-                             id="metrics_line", classes="metric-line")
+                yield Static("", id="metrics")
+                with Horizontal():
+                    yield Label("loss", classes="spark-label")
+                    yield Sparkline(data=[0.0, 0.0], id="loss_spark")
+                with Horizontal():
+                    yield Label("tok/s", classes="spark-label")
+                    yield Sparkline(data=[0.0, 0.0], id="tps_spark")
         with Vertical(classes="card"):
             yield Static("LIVE LOGS", classes="card-title")
             yield RichLog(id="logs", highlight=True, markup=False, wrap=False, auto_scroll=True)
@@ -241,6 +286,7 @@ class AriaTUI(App):
             yield Label("[left] max bytes  [right] temperature")
         with Vertical(classes="card"):
             yield Static("MODEL OUTPUT", classes="card-title")
+            yield ProgressBar(total=100, id="depth_meter", show_eta=False)
             yield RichLog(id="think_out", markup=True, wrap=True, auto_scroll=True)
 
     def _compose_config(self) -> ComposeResult:
@@ -253,35 +299,41 @@ class AriaTUI(App):
 
     def on_mount(self) -> None:
         self._logs_widget = self.query_one("#logs", RichLog)
-        self._metrics_widget = self.query_one("#metrics_line", Static)
+        self._metrics_widget = self.query_one("#metrics", Static)
         self._status_widget = self.query_one("#status_badge", Static)
         self._progress_widget = self.query_one("#progress", ProgressBar)
+        self._loss_spark = self.query_one("#loss_spark", Sparkline)
+        self._tps_spark = self.query_one("#tps_spark", Sparkline)
         self.set_interval(0.5, self._poll)
+        self.set_interval(1.1, self._pulse)
+        self._logs_widget.write(
+            "[dim]Aria Control Room online. s=start · p=pause · x=stop · q=quit[/dim]")
 
     # -- polling ---------------------------------------------------------
 
     def _poll(self) -> None:
-        # Logs — append only new lines.
         raw = self.ctrl.get_logs()
         lines = raw.split("\n") if raw else []
         if len(lines) > self._last_log_len:
-            new = lines[self._last_log_len:]
-            for line in new:
+            for line in lines[self._last_log_len:]:
                 if line:
                     self._logs_widget.write(line)
             self._last_log_len = len(lines)
 
-        # Metrics — show most recent tuple (step, loss, tok/s, mem).
         m = self.ctrl.get_metrics()
         if m:
             step, loss, tok_s, mem = m[-1]
             if step != self._last_metric_step:
-                self._metrics_widget.update(
-                    f"step {step}  loss {loss:.4f}  tok/s {tok_s:.0f}  mem {mem:.2f}GB"
-                )
+                self._loss_hist.append(loss)
+                self._tps_hist.append(tok_s)
+                if len(self._loss_hist) > 100:
+                    self._loss_hist.pop(0)
+                    self._tps_hist.pop(0)
+                self._loss_spark.data = self._loss_hist if len(self._loss_hist) > 1 else [loss, loss]
+                self._tps_spark.data = self._tps_hist if len(self._tps_hist) > 1 else [tok_s, tok_s]
+                self._metrics_widget.update(self._fmt_metrics(m))
                 self._last_metric_step = step
 
-        # Status + progress.
         st = self.ctrl.get_state()
         label = STATUS_LABELS.get(st["status"], st["status"])
         self._status_widget.update(f"{label}   step {st['step']}/{st['total']}")
@@ -290,6 +342,24 @@ class AriaTUI(App):
         self._status_widget.add_class(STATUS_CLASSES.get(st["status"], "-idle"))
         pct = max(0.0, min(1.0, float(st["frac"]))) * 100.0
         self._progress_widget.update(total=100, progress=pct)
+
+    def _pulse(self) -> None:
+        if self.ctrl.get_state()["status"] == "running":
+            self._pulse_state = 0.45 if self._pulse_state > 0.7 else 1.0
+            self._status_widget.animate("opacity", self._pulse_state, duration=0.9)
+        elif self._status_widget.styles.opacity != 1.0:
+            self._status_widget.styles.opacity = 1.0
+
+    @staticmethod
+    def _fmt_metrics(m) -> str:
+        step, loss, tok_s, mem = m[-1]
+        loss_col = "#34e89e" if loss < 1.0 else ("#ff8a3d" if loss < 2.0 else "#ff5c5c")
+        return (
+            f"[#6b7c8c]step[/] [#2dd4bf]{step}[/]    "
+            f"[#6b7c8c]loss[/] [{loss_col}]{loss:.4f}[/]    "
+            f"[#6b7c8c]tok/s[/] [#2dd4bf]{tok_s:.0f}[/]    "
+            f"[#6b7c8c]mem[/] [#ff8a3d]{mem:.2f}GB[/]"
+        )
 
     # -- actions ---------------------------------------------------------
 
@@ -347,11 +417,10 @@ class AriaTUI(App):
 
     # -- thinking --------------------------------------------------------
 
-    from textual import work
-
     @work(thread=True)
     def _run_thinking(self) -> None:
         out = self.query_one("#think_out", RichLog)
+        meter = self.query_one("#depth_meter", ProgressBar)
         prompt = self.query_one("#prompt_input", Input).value.strip()
         if not prompt:
             out.write("[dim]empty prompt[/dim]")
@@ -371,6 +440,8 @@ class AriaTUI(App):
                              max_loops=loops, device=device)
             current_line = []
             for b, depth in pairs:
+                ratio = max(0.0, min(1.0, depth / max(loops, 1)))
+                meter.update(total=100, progress=ratio * 100)
                 if not (0 <= b <= 255):
                     ch = f"<{b}>"
                 elif b == 10:
@@ -380,16 +451,11 @@ class AriaTUI(App):
                     continue
                 else:
                     ch = chr(b)
-                ratio = max(0.0, min(1.0, depth / max(loops, 1)))
-                if ratio < 0.5:
-                    color = "green"
-                elif ratio < 0.8:
-                    color = "yellow"
-                else:
-                    color = "red"
+                color = "green" if ratio < 0.5 else ("yellow" if ratio < 0.8 else "red")
                 current_line.append(f"[{color}]{ch}[/{color}]")
             if current_line:
                 out.write("".join(current_line))
+            meter.update(total=100, progress=0)
         except Exception as e:
             out.write(f"[red]thinking failed: {type(e).__name__}: {e}[/red]")
 

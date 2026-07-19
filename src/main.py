@@ -40,6 +40,30 @@ def run_pretrain(cfg, steps=None, checkpoint_path=None, save_every=500, resume_p
                        mtp_loss_coef=getattr(cfg, "mtp_loss_coef", 0.1),
                        loop_checkpoint=cfg.use_checkpointing)
     model = model.cuda().to(torch.bfloat16)
+    # ponytail: torch.compile fuses the dense matmul/layernorm/attn subgraphs;
+    # Triton SCT kernels + adaptive branching become graph breaks (fullgraph=False),
+    # but fusion on the rest still wins. dynamic=True: shape varies by batch/seq.
+    # ponytail: torch.compile is OFF by default — measured 6504 tok/s eager vs
+    # 5569 compiled (graph breaks on every Triton SCT kernel + Hadamard
+    # autograd.Function make fusion overhead exceed its win for this arch).
+    # ARIA_COMPILE=1 → encoder/decoder only (experimental).
+    # ARIA_COMPILE=2 → full model fullgraph=True (needs sct_kernel=false +
+    # ARIA_NO_FUSE=1 + use_checkpointing=false for a clean graph).
+    _compile_mode = os.environ.get("ARIA_COMPILE")
+    if _compile_mode == "2":
+        try:
+            torch._dynamo.config.compiled_autograd = True
+            model = torch.compile(model, fullgraph=True, dynamic=True)
+            print("torch.compile: ON (full model, fullgraph=True, compiled_autograd)")
+        except Exception as e:
+            print(f"torch.compile: OFF ({e})")
+    elif _compile_mode == "1":
+        try:
+            model.encoder = torch.compile(model.encoder, dynamic=True)
+            model.decoder = torch.compile(model.decoder, dynamic=True)
+            print("torch.compile: ON (encoder+decoder, experimental)")
+        except Exception as e:
+            print(f"torch.compile: OFF ({e})")
     print(f"Params: {count_params(model):,}")
     model.train()
 
