@@ -59,8 +59,11 @@ def run_pretrain(cfg, steps=None, checkpoint_path=None, save_every=500, resume_p
             # breaks fullgraph; HelixCore alone is clean and fuses the hot loop.
             # dynamic=False: shapes are fixed per run (B,T,D static), avoids the
             # symbolic-stride inductor codegen bug ("Exponent must be non-negative").
-            model.helix = torch.compile(model.helix, fullgraph=True, dynamic=False)
-            print("torch.compile: ON (helix only, fullgraph)")
+            # fullgraph=False: NSA interleaves torch.nonzero() in the loop (adaptive
+            # selection) which breaks fullgraph; the GDN2 recurrence still fuses,
+            # only the sparse-attention node graph-breaks (few ops, negligible).
+            model.helix = torch.compile(model.helix, fullgraph=False, dynamic=False)
+            print("torch.compile: ON (helix, fullgraph=False)")
         except Exception as e:
             print(f"torch.compile: OFF ({e})")
     elif _compile_mode == "1":
