@@ -55,9 +55,10 @@ training_stages:
     batch_size: 16
 
 # --- Technical optimizations (Blackwell) ---
-sct_kernel: false
+sct_kernel: true
 sct_fp8: false
 adaptive_loops: false
+worldmodel_halt: false
 use_checkpointing: false
 bitnet_v2: true
 bitnet_act_bits: 4

@@ -28,13 +28,11 @@ import torch.nn.functional as F
 _HADAMARD_CACHE = {}
 
 
-def _hadamard_matrix(n, device, dtype):
+def _hadamard_matrix(n, dtype):
     """Normalized Sylvester Hadamard (n x n, entries ±1/sqrt(n)), n = 2^m.
 
-    Cached per (n, dtype) on CPU; the caller moves to the right device outside
-    the compiled graph (autograd.Function is a graph break, so .to() there is
-    safe). allow_in_graph keeps this a black box for Dynamo — no device-object
-    dict keys, no in-graph .to() confusing fake-tensor mode.
+    Cached per (n, dtype) on CPU; caller moves to the right device outside the
+    compiled graph (H is a plain buffer, no autograd, so .to() is graph-safe).
     """
     if (n, dtype) in _HADAMARD_CACHE:
         return _HADAMARD_CACHE[(n, dtype)]
@@ -57,37 +55,25 @@ def _next_pow2(n):
     return p
 
 
-class _HadamardTransform(torch.autograd.Function):
-    """Online Hadamard on the last dim (padded to next pow2), STE-free.
+def hadamard(x, use_hadamard=True):
+    """Online Hadamard on the last dim (padded to next pow2).
 
-    H is orthogonal, so the exact gradient is H applied to the incoming grad
-    (same transform). Padding is zeros, so it folds through cleanly.
+    H is orthogonal & symmetric (H^T == H, H^2 == I), so its exact gradient is
+    the same transform — no custom autograd.Function, keeping it torch.compile-
+    friendly (fullgraph). Plain matmul with a cached buffer.
     """
-
-    @staticmethod
-    def forward(ctx, x):
-        D = x.shape[-1]
-        P = _next_pow2(D)
-        ctx.P, ctx.D = P, D
-        flat = x.reshape(-1, D)
-        if P != D:
-            flat = F.pad(flat, (0, P - D))
-        H = _hadamard_matrix(P, x.device, x.dtype).to(x.device)
-        out = flat @ H.T
-        # ponytail: return the unpadded dim so the activation keeps x's shape
-        return out.reshape(*x.shape[:-1], P)[..., :D]
-
-    @staticmethod
-    def backward(ctx, grad):
-        P, D = ctx.P, ctx.D
-        H = _hadamard_matrix(P, grad.device, grad.dtype).to(grad.device)
-        flat = grad.reshape(-1, D)
-        if P != D:
-            flat = F.pad(flat, (0, P - D))   # pad to match the H multiply
-        g = flat @ H.T          # ponytail: H is orthogonal & symmetric, so H^T == H (unitary)
-        if P != D:
-            g = g[:, :D]
-        return g.reshape(*grad.shape[:-1], D)
+    if not use_hadamard:
+        return x
+    D = x.shape[-1]
+    P = _next_pow2(D)
+    flat = x.reshape(-1, D)
+    if P != D:
+        flat = F.pad(flat, (0, P - D))
+    H = _hadamard_matrix(P, x.dtype).to(x.device)
+    out = flat @ H.T
+    if P != D:
+        out = out[..., :D]
+    return out.reshape(*x.shape[:-1], D)
 
 
 def _quantize_act(x, bits):
@@ -108,35 +94,9 @@ def _quantize_act(x, bits):
         return (q / 7 * beta - x).detach() + x
 
 
-class _ActQuant(torch.autograd.Function):
-    """Hadamard -> quantize, with STE through the quant and exact grad through
-    the Hadamard. Saves the int tensor for the memory win; reconstructs in
-    backward via STE (gradient flows to the pre-quant Hadamard output)."""
-
-    @staticmethod
-    def forward(ctx, x, bits, use_hadamard):
-        xh = _HadamardTransform.apply(x) if use_hadamard else x
-        ctx.bits = bits
-        ctx.use_hadamard = use_hadamard
-        ctx.d_in = x.shape[-1]
-        ctx.save_for_backward(xh)
-        return _quantize_act(xh, bits)
-
-    @staticmethod
-    def backward(ctx, grad):
-        (xh,) = ctx.saved_tensors
-        # ponytail: STE — grad flows straight to the pre-quant Hadamard output
-        g = grad
-        if ctx.use_hadamard:
-            g = _HadamardTransform.apply(g)
-        if g.shape[-1] != ctx.d_in:
-            g = g[:, :ctx.d_in]
-        return g, None, None
-
-
 def hadamard_quantize(x, bits=8, use_hadamard=True):
     """Stateless entry point: return the 4/8-bit-quantized activation of x."""
-    return _ActQuant.apply(x, bits, use_hadamard)
+    return _quantize_act(hadamard(x, use_hadamard), bits)
 
 
 def _pack_int4(q):
@@ -164,59 +124,46 @@ def _dequant(q, scale, bits, packed):
     return q * (scale / 127.0 if bits >= 8 else scale / 7.0)
 
 
-class _BitnetActQuant(torch.autograd.Function):
-    """Full BitNet activation quant at the source.
+def _bitnet_act_quant(x, bits, use_hadamard):
+    """Full BitNet activation quant at the source (torch.compile-friendly).
 
-    Quantize x ONCE -> return the dequantized float to feed every consumer
-    (residual / KAN / gates / recurrent). We save ONLY the int codes + scale
-    (tiny) in ctx and NOT the bf16 x, so x is released after forward. The
-    backward is straight-through through the quant and the (orthogonal) Hadamard,
-    so it never needs the bf16 activation either — this is the memory win: the
-    persisted activation across loop steps is int, not bf16.
+    Quantize ONCE -> return dequantized float to feed every consumer. STE through
+    the quant; Hadamard is orthogonal (H^2 = I) so the forward rotation and its
+    backward cancel exactly — no autograd.Function, pure tensor ops. The bf16 x
+    is released after forward (only int codes + scale kept transiently).
     """
-
-    @staticmethod
-    def forward(ctx, x, bits, use_hadamard):
-        xh = _HadamardTransform.apply(x) if use_hadamard else x
-        if bits >= 8:
-            scale = xh.abs().amax(-1, keepdim=True).clamp(min=1e-12)
-            q = (xh / scale * 127).round().clamp(-128, 127).to(torch.int8)
-            packed = False
-        else:
-            scale = xh.abs().mean(-1, keepdim=True).clamp(min=1e-12)
-            q = (xh / scale * 7).round().clamp(-8, 7).to(torch.int8)
-            packed = xh.shape[-1] % 2 == 0
-            if packed:
-                q = _pack_int4(q)
-        ctx.bits, ctx.use_hadamard, ctx.packed = bits, use_hadamard, packed
-        ctx.q = q
-        ctx.scale = scale
-        deq = _dequant(q, scale, bits, packed)
-        # ponytail: de-rotate back to the original (non-Hadamard) basis so
-        # the HelixCore residual stream (engram_mem, LTI injection) stays in
-        # one coherent space. H^2 = I for Sylvester Hadamard, so this is exact.
-        if use_hadamard:
-            deq = _HadamardTransform.apply(deq)
-        return deq
-
-    @staticmethod
-    def backward(ctx, grad):
-        # ponytail: two orthogonal Hadamard applications cancel (H^2 = I),
-        # so the gradient is passed straight through to x (STE for the quant).
-        return grad, None, None
+    xh = hadamard(x, use_hadamard)
+    if bits >= 8:
+        scale = xh.abs().amax(-1, keepdim=True).clamp(min=1e-12)
+        q = (xh / scale * 127).round().clamp(-128, 127).to(torch.int8)
+        packed = False
+    else:
+        scale = xh.abs().mean(-1, keepdim=True).clamp(min=1e-12)
+        q = (xh / scale * 7).round().clamp(-8, 7).to(torch.int8)
+        packed = xh.shape[-1] % 2 == 0
+        if packed:
+            q = _pack_int4(q)
+    deq = _dequant(q, scale, bits, packed)
+    # ponytail: de-rotate back to the original (non-Hadamard) basis so the
+    # HelixCore residual stream (engram_mem, LTI injection) stays in one coherent
+    # space. H^2 = I for Sylvester Hadamard, so this is exact.
+    if use_hadamard:
+        deq = hadamard(deq, True)
+    # STE: grad flows straight to x (orthogonal Hadamards cancel in backward).
+    return (deq - x).detach() + x
 
 
 def bitnet_quantize_act(x, bits=8, use_hadamard=True):
     """Quantize activation x once (full BitNet path). Returns the dequantized
     float to feed every consumer; stores only int codes internally so the bf16
     x is released."""
-    return _BitnetActQuant.apply(x, bits, use_hadamard)
+    return _bitnet_act_quant(x, bits, use_hadamard)
 
 
 def bitnet_int_codes(x, bits=8, use_hadamard=True):
     """Detached int codes + scale for a quantized activation (storage / VRAM
     introspection). No autograd edge to x."""
-    xh = _HadamardTransform.apply(x) if use_hadamard else x
+    xh = hadamard(x, use_hadamard)
     if bits >= 8:
         scale = xh.abs().amax(-1, keepdim=True).clamp(min=1e-12)
         q = (xh / scale * 127).round().clamp(-128, 127).to(torch.int8)
@@ -283,7 +230,7 @@ def _run_checks():
     H = _hadamard_matrix(8, dev, torch.float32)
     assert torch.allclose(H @ H, torch.eye(8), atol=1e-4), "H not orthogonal"
     t = torch.randn(3, 8, requires_grad=True)
-    out = _HadamardTransform.apply(t)
+    out = hadamard(t, True)
     grad_in = torch.randn(3, 8)
     out.backward(grad_in)
     # ponytail: y = x @ H  =>  dL/dx = dL/dy @ H  (H symmetric, orthogonal)

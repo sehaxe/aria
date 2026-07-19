@@ -53,8 +53,14 @@ def run_pretrain(cfg, steps=None, checkpoint_path=None, save_every=500, resume_p
     if _compile_mode == "2":
         try:
             torch._dynamo.config.compiled_autograd = True
-            model = torch.compile(model, fullgraph=True, dynamic=True)
-            print("torch.compile: ON (full model, fullgraph=True, compiled_autograd)")
+            # ponytail: compile only HelixCore (the dominant compute: 8x GDN2 +
+            # FFN recurrence). Encoder/decoder + JEPA/NSA keep data-dependent
+            # control flow (mask.sum() guards, gru rollout, engram lookup) that
+            # breaks fullgraph; HelixCore alone is clean and fuses the hot loop.
+            # dynamic=False: shapes are fixed per run (B,T,D static), avoids the
+            # symbolic-stride inductor codegen bug ("Exponent must be non-negative").
+            model.helix = torch.compile(model.helix, fullgraph=True, dynamic=False)
+            print("torch.compile: ON (helix only, fullgraph)")
         except Exception as e:
             print(f"torch.compile: OFF ({e})")
     elif _compile_mode == "1":

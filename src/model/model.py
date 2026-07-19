@@ -195,8 +195,8 @@ class AriaModel(nn.Module):
             ce = F.cross_entropy(logits.view(-1, VOCAB_SIZE), masked_targets.view(-1),
                                  ignore_index=PAD_ID)
             # ponytail: CE=NaN when ALL targets are PAD (image-only batch).
-            # Fall back to ponder loss in that case.
-            loss = ce if torch.isfinite(ce) else torch.zeros_like(ce)
+            # Fall back to ponder loss in that case (branchless for torch.compile).
+            loss = torch.where(torch.isfinite(ce), ce, torch.zeros_like(ce))
             if self.training and len(halt_probs) > 0:
                 remaining = 1.0 - torch.stack(halt_probs, dim=0).sum(dim=0)
                 loss = loss + self.ponder_lambda * remaining.mean()
@@ -206,8 +206,9 @@ class AriaModel(nn.Module):
                 elif self.speculative:
                     loss = loss + self.speculative_loss_coef * self._draft_loss(h, x, patches, is_image_mask)
             fl = getattr(self.helix, "last_forecaster_loss", None)
-            if fl is not None and float(fl.detach()) != 0.0:
-                loss = loss + fl
+            # ponytail: branchless add (fl is 0 when forecaster inactive); the
+            # Python float() guard breaks torch.compile (data-dependent).
+            loss = loss + (fl if fl is not None else torch.zeros_like(loss))
             if return_hidden:
                 return (loss, halt_probs, h, state_codes)
             return (loss, halt_probs) if return_halt else loss

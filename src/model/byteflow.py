@@ -59,7 +59,10 @@ class ByteFlowDecoder(nn.Module):
         self.max_patch_len = max_patch_len
         self.decoder_head = SCTLinear(d_model, 128, rank=rank, max_sigma=max_sigma)
         self.image_head = nn.Linear(128, 768, bias=False)
-        self.gru_cell = nn.GRUCell(128, 128)
+        # ponytail: GRU cell as plain linear gates (no nn.GRUCell — its
+        # _thnn_fused_gru_cell autograd op breaks torch.compile meta-tensors).
+        self.gru_ih = nn.Linear(128, 384, bias=False)
+        self.gru_hh = nn.Linear(128, 384, bias=False)
         self.classifier = nn.Linear(128, VOCAB_SIZE)
 
     def forward(self, x, is_image_mask, target_bytes=None):
@@ -77,7 +80,11 @@ class ByteFlowDecoder(nn.Module):
         current_state = init_states
         input_emb = torch.zeros_like(init_states)
         for _ in range(L):
-            current_state = self.gru_cell(input_emb, current_state)
+            gates = self.gru_ih(input_emb) + self.gru_hh(current_state)
+            r, z, n = gates.chunk(3, dim=-1)
+            r, z = torch.sigmoid(r), torch.sigmoid(z)
+            n = torch.tanh(n)
+            current_state = (1 - z) * n + z * current_state
             step_logits = self.classifier(current_state)
             logits_list.append(step_logits)
             # ponytail: closed-loop rollout; teacher forcing left unwired (dump's

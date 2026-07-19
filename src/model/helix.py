@@ -9,119 +9,8 @@ from .lti_injection import LTIInjection
 from .loop_ln import LoopModulatedLN
 from .sct import SCTLinear
 from .engram import DeepSeekEngram
-from kernels.fused_gru_lti import FusedGRULTI
 from mask import combined_mask
-from bitnet_v2 import bitnet_int_codes, _dequant, _HadamardTransform
-
-
-class _BitnetRecStep(torch.autograd.Function):
-    """Int-storage recurrent checkpoint (BitNet v2, no torch.checkpoint).
-
-    Stores the recurrent hidden state h and the quantized input x_encoded as int
-    activation codes — not bf16 — so the between-step state is tiny. Backward
-    recomputes the step from the int codes (STE through the quant, exact through
-    the orthogonal Hadamard) instead of holding all loop steps' bf16 activations.
-    This is what lets BitNet train without torch checkpointing.
-    """
-
-    @staticmethod
-    def forward(ctx, helix, h, x_enc, xq, xs, xp, engram_mem, step, prev_conf, mask,
-                is_last, bits, hadamard):
-        hq, hs, hp = bitnet_int_codes(h, bits, hadamard)
-        h_dq = _dequant(hq, hs, bits, hp)
-        x_dq = _dequant(xq, xs, bits, xp)
-        # ponytail: _dequant reconstructs in the Hadamard basis (codes are
-        # quantized AFTER H). De-rotate so _loop_step's residual stream (loop_embs,
-        # engram_mem, LTI injection) stays in one coherent (original) basis.
-        if hadamard:
-            h_dq = _HadamardTransform.apply(h_dq)
-            x_dq = _HadamardTransform.apply(x_dq)
-        ctx.helix = helix
-        ctx.bits, ctx.hadamard = bits, hadamard
-        ctx.hp, ctx.xp = hp, xp
-        ctx.step, ctx.mask, ctx.is_last = step, mask, is_last
-        # ponytail: constant (non-grad) inputs kept on ctx; only h carries grad.
-        # x codes are the shared loop constant passed in (one allocation).
-        ctx.engram_mem = engram_mem
-        ctx.prev_conf = prev_conf
-        ctx.save_for_backward(hq, hs, xq, xs)   # int codes only (tiny)
-        h_next, halt = helix._loop_step(h_dq, x_dq, engram_mem, step, prev_conf)
-        if mask is not None:
-            h_det = h_dq + (h_next - h_dq).detach()
-            h_next = torch.where(mask[step], h_det, h_next)
-        if is_last:
-            halt = torch.ones_like(halt)
-        return h_next, halt
-
-    @staticmethod
-    def backward(ctx, g_hnext, g_halt):
-        helix = ctx.helix
-        hq, hs, xq, xs = ctx.saved_tensors
-        h_dq = _dequant(hq, hs, ctx.bits, ctx.hp).requires_grad_(True)
-        x_dq = _dequant(xq, xs, ctx.bits, ctx.xp).requires_grad_(True)
-        # ponytail: mirror forward de-rotation (H reverts the Hadamard basis)
-        if ctx.hadamard:
-            h_dq = _HadamardTransform.apply(h_dq)
-            x_dq = _HadamardTransform.apply(x_dq)
-        with torch.enable_grad():
-            h_next, halt = helix._loop_step(h_dq, x_dq, ctx.engram_mem,
-                                            ctx.step, ctx.prev_conf)
-            if ctx.mask is not None:
-                h_det = h_dq + (h_next - h_dq).detach()
-                h_next = torch.where(ctx.mask[ctx.step], h_det, h_next)
-            if ctx.is_last:
-                halt = torch.ones_like(halt)
-        # ponytail: the last step's halt is a constant (ones), so it carries no
-        # grad — only backprop through it when it actually requires grad.
-        outs, gouts = [h_next], [g_hnext]
-        if halt.requires_grad:
-            outs.append(halt)
-            gouts.append(g_halt)
-        torch.autograd.backward(outs, gouts, retain_graph=False)
-        g_h = h_dq.grad
-        g_x = x_dq.grad
-        if ctx.hadamard:
-            g_h = _HadamardTransform.apply(g_h)
-            g_x = _HadamardTransform.apply(g_x)
-        # ponytail: grad slots -- helix, h, x_enc(grad edge), xq/xs/xp(const),
-        # engram_mem, step, prev_conf, mask, is_last, bits, hadamard.
-        return (None, g_h, g_x, None, None, None, None, None, None, None, None, None, None)
-
-
-class _BitnetAccumulate(torch.autograd.Function):
-    """Accumulate the recurrent trajectory with int-storage of h_next.
-
-    out = acc + halt_prob * h_next. The recurrent hidden states would otherwise
-    pile up as bf16 across all n_loops (this is the only cost that scales with
-    n_loops and blows VRAM at n_loops=48). We store h_next as int activation
-    codes (tiny) instead of bf16, and free the bf16 tensor after the step.
-
-    Forward values stay EXACT (the op runs on the live bf16 h_next); only the
-    halt_prob gradient round-trips through the int codes (standard BitNet STE),
-    so the recurrent-weight gradient path is unaffected.
-    """
-
-    @staticmethod
-    def forward(ctx, acc, halt_prob, h_next, hq, hs, hp, bits, hadamard):
-        ctx.bits, ctx.hadamard = bits, hadamard
-        ctx.hp = hp
-        # ponytail: store int codes (hq,hs) + the tiny halt_prob; never the bf16 h_next.
-        ctx.save_for_backward(hq, hs, halt_prob)
-        return acc + halt_prob * h_next
-
-    @staticmethod
-    def backward(ctx, g):
-        hq, hs, halt_prob = ctx.saved_tensors
-        h_dq = _dequant(hq, hs, ctx.bits, ctx.hp)
-        g_acc = g
-        g_halt = g * h_dq
-        g_h_next = g * halt_prob
-        return g_acc, g_halt, g_h_next, None, None, None, None, None
-
-
-# ponytail: the loop body calls two custom Triton autograd.Functions
-# (FusedGRULTI + FusedHFWBasis via DynamicFFN). Dynamo can't safely trace
-# those, so run the loop eager; the surrounding anchor/synth still fuse.
+from bitnet_v2 import bitnet_int_codes, _dequant, hadamard
 
 
 class HelixCore(nn.Module):
@@ -223,6 +112,7 @@ class HelixCore(nn.Module):
             h_cand = (1 - z) * n + z * h
             h_next = self.lti.A_scale * h_cand + self.lti.B_scale * x_encoded
         else:
+            from kernels.fused_gru_lti import FusedGRULTI
             h_next = FusedGRULTI.apply(proj_x, proj_h, h, x_encoded,
                                        self.lti.A_scale, self.lti.B_scale)
         halt_prob = torch.sigmoid(self.halt_predictor(h_next))
@@ -230,7 +120,7 @@ class HelixCore(nn.Module):
 
     def forward(self, x, tokens=None, max_loops=None, record_traj=False, compute_forecaster=True):
         B, T, D = x.shape
-        max_loops = max_loops or self.max_loops
+        max_loops = self.max_loops if max_loops is None else max_loops
         # ponytail: engram is keyed by raw token ids + n-gram stats; static across
         # the recurrence, so compute ONCE (not per-loop) to kill N-fold hash+lookup HBM traffic.
         engram_mem = self.engram(x, tokens) if tokens is not None else None
@@ -284,7 +174,7 @@ class HelixCore(nn.Module):
             x_dq = _dequant(xq, xs, bits, xp)
             # ponytail: de-rotate to original basis (see _BitnetRecStep.forward)
             if had:
-                x_dq = _HadamardTransform.apply(x_dq)
+                x_dq = hadamard(x_dq)
         else:
             x_dq = x_encoded
         h = x_encoded
@@ -311,7 +201,7 @@ class HelixCore(nn.Module):
                     hq, hs, hp = bitnet_int_codes(h, bits, had)
                     h_dq = _dequant(hq, hs, bits, hp)
                     if had:
-                        h_dq = _HadamardTransform.apply(h_dq)
+                        h_dq = hadamard(h_dq)
                     h_next, halt_prob = self._loop_step(h_dq, x_dq, engram_mem, step, prev_conf)
                     if not is_last:
                         halted = halt_prob > 0.5
@@ -333,7 +223,7 @@ class HelixCore(nn.Module):
                             hq_a, hs_a, hp_a = bitnet_int_codes(h_a, bits, had)
                             h_a = _dequant(hq_a, hs_a, bits, hp_a)
                             if had:
-                                h_a = _HadamardTransform.apply(h_a)
+                                h_a = hadamard(h_a)
                         h_next_a, halt_a = self._loop_step(h_a, x_a, em, step, pc)
                         conf = halt_a.reshape(-1, 1)
                         if is_last:
@@ -364,7 +254,7 @@ class HelixCore(nn.Module):
                     hq_a, hs_a, hp_a = bitnet_int_codes(h_a, bits, had)
                     h_a = _dequant(hq_a, hs_a, bits, hp_a)
                     if had:
-                        h_a = _HadamardTransform.apply(h_a)
+                        h_a = hadamard(h_a)
                 h_next_a, halt_a = self._loop_step(h_a, x_a, em, step, pc)
                 h_next_a = h_next_a.reshape(k, D)
                 halt_a = halt_a.reshape(k, 1)
@@ -385,7 +275,7 @@ class HelixCore(nn.Module):
                 hq, hs, hp = bitnet_int_codes(h, bits, had)
                 h_dq = _dequant(hq, hs, bits, hp)
                 if had:
-                    h_dq = _HadamardTransform.apply(h_dq)
+                    h_dq = hadamard(h_dq)
                 h_next, halt_prob = self._loop_step(h_dq, x_dq, engram_mem, step, prev_conf)
                 if mask is not None:
                     h_det = h_dq + (h_next - h_dq).detach()
@@ -417,7 +307,7 @@ class HelixCore(nn.Module):
                 hq, hs, hp = bitnet_int_codes(h_next, bits, had)
                 h_next_dq = _dequant(hq, hs, bits, hp)
                 if had:
-                    h_next_dq = _HadamardTransform.apply(h_next_dq)
+                    h_next_dq = hadamard(h_next_dq)
                 state_codes.append(h_next_dq)
                 if use_int_checkpoint:
                     accumulated = _BitnetAccumulate.apply(

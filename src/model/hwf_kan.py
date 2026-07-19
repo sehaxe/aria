@@ -4,68 +4,42 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from .sct import SCTLinear
-from kernels.hfw_basis import FusedHFWBasis
 
 
-class _Fp8KANLinear(torch.autograd.Function):
-    # ponytail: amax-divide (x/|x|max -> fp8) + scale=|x|max; scaled_mm multiplies back.
-    @staticmethod
-    def forward(ctx, x, w, dtype):
-        ctx.save_for_backward(x, w)
-        sa = x.abs().amax().clamp_min(1e-12).float()
-        sw = w.abs().amax().clamp_min(1e-12).float()
-        A = (x / sa).to(torch.float8_e4m3fn)
-        B = (w.T / sw).contiguous().to(torch.float8_e4m3fn)  # (K, O)
-        return torch._scaled_mm(A, B, sa, sw, out_dtype=dtype)
+def hfw_basis(x, degree=6, num_frequencies=3):
+    """Hermite-Fourier-Wavelet basis, pure tensor ops (torch.compile-friendly).
 
-    @staticmethod
-    def backward(ctx, grad):
-        x, w = ctx.saved_tensors
-        return grad @ w, grad.T @ x, None
+    Input x (B,S,D) -> phi (B,S,D,M), M = degree + 2*num_frequencies.
+    Replaces the Triton FusedHFWBasis (autograd.Function) so the whole KAN
+    layer fuses under torch.compile (fullgraph).
+    """
+    x_scaled = 2.0 * torch.tanh(x / 2.0)
+    hermite = [torch.ones_like(x_scaled)]
+    if degree > 1:
+        h_prev2, h_prev1 = hermite[0], 2.0 * x_scaled
+        hermite.append(h_prev1)
+        for n in range(2, degree):
+            h_curr = 2.0 * x_scaled * h_prev1 - 2.0 * (n - 1) * h_prev2
+            hermite.append(h_curr)
+            h_prev2, h_prev1 = h_prev1, h_curr
+    H = torch.stack(hermite, dim=-1)
+    wavelet_part = H * torch.exp(-0.5 * (x_scaled * x_scaled)).unsqueeze(-1)
+    if num_frequencies > 0:
+        fourier = [comp(x_scaled) for k in range(1, num_frequencies + 1)
+                   for comp in (torch.sin, torch.cos)]
+        phi = torch.cat([wavelet_part, torch.stack(fourier, dim=-1)], dim=-1)
+    else:
+        phi = wavelet_part
+    return phi
 
 
-class HermiteFourierWaveletBasis(nn.Module):
-    """Стабильный базис функций Эрмита-Фурье-Вейвлета (HFW-Basis)."""
-    def __init__(self, degree=6, num_frequencies=3):
-        super().__init__()
-        self.degree = degree
-        self.num_frequencies = num_frequencies
-
-    def forward(self, x):
-        """
-        Вход: x (B, S, D)
-        Выход: phi (B, S, D, M), M = degree + 2 * num_frequencies
-        """
-        x_scaled = 2.0 * torch.tanh(x / 2.0)
-
-        # Полиномы Эрмита по рекуррентной схеме
-        hermite = []
-        h_prev2 = torch.ones_like(x_scaled)
-        hermite.append(h_prev2)
-        if self.degree > 1:
-            h_prev1 = 2.0 * x_scaled
-            hermite.append(h_prev1)
-            for n in range(2, self.degree):
-                h_curr = 2.0 * x_scaled * h_prev1 - 2.0 * (n - 1) * h_prev2
-                hermite.append(h_curr)
-                h_prev2, h_prev1 = h_prev1, h_curr
-        H = torch.stack(hermite, dim=-1)
-
-        # Гауссова огибающая → функции Эрмита (wavelet part)
-        envelope = torch.exp(-0.5 * (x_scaled ** 2)).unsqueeze(-1)
-        wavelet_part = H * envelope
-
-        # Фурье-гармоники
-        if self.num_frequencies > 0:
-            fourier = []
-            for k in range(1, self.num_frequencies + 1):
-                fourier.append(torch.sin(k * x_scaled))
-                fourier.append(torch.cos(k * x_scaled))
-            fourier_part = torch.stack(fourier, dim=-1)
-            phi = torch.cat([wavelet_part, fourier_part], dim=-1)
-        else:
-            phi = wavelet_part
-        return phi
+def _fp8_linear(x, w, dtype):
+    """e4m3 scaled-mm (compile-friendly; no autograd.Function)."""
+    sa = x.abs().amax().clamp_min(1e-12).float()
+    sw = w.abs().amax().clamp_min(1e-12).float()
+    A = (x / sa).to(torch.float8_e4m3fn)
+    B = (w.T / sw).contiguous().to(torch.float8_e4m3fn)
+    return torch._scaled_mm(A, B, sa, sw, out_dtype=dtype)
 
 
 class HFW_KANLayer(nn.Module):
@@ -93,19 +67,15 @@ class HFW_KANLayer(nn.Module):
         *lead, I = x.shape
         O = self.out_features
         x_flat = x.reshape(-1, I)
-        if self.fp8:
-            base_out = _Fp8KANLinear.apply(x_flat, self.base_weight, torch.bfloat16)
-        else:
-            base_out = F.linear(x_flat, self.base_weight)
+        base_out = _fp8_linear(x_flat, self.base_weight, torch.bfloat16) if self.fp8 \
+            else F.linear(x_flat, self.base_weight)
         base_out = base_out.reshape(*lead, O)
-        phi = FusedHFWBasis.apply(x, self.degree, self.num_frequencies)
+        phi = hfw_basis(x, self.degree, self.num_frequencies)
         B, S, I2, M = phi.shape
         w = self.coeffs.reshape(O, I2 * M)
         phi_flat = phi.reshape(-1, I2 * M)
-        if self.fp8:
-            kan_out = _Fp8KANLinear.apply(phi_flat, w, torch.bfloat16)
-        else:
-            kan_out = F.linear(phi_flat, w)
+        kan_out = _fp8_linear(phi_flat, w, torch.bfloat16) if self.fp8 \
+            else F.linear(phi_flat, w)
         kan_out = kan_out.reshape(*lead, O)
         return base_out + kan_out
 
