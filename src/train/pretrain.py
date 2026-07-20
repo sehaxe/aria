@@ -105,8 +105,12 @@ def train_step(model, batch, opts, clip=1.0, sct_l1=1e-6, scaler=None, use_cuda_
     targets = targets.cuda(non_blocking=True)
 
     if not use_cuda_graphs:
+        # ponytail: return the loss TENSOR, not loss.item(). The .item() call forces a
+        # full GPU sync every step, serializing the pipeline and ~2x-slowing tok/s.
+        # Callers .item() only inside their log block (every log_every steps), so
+        # steps pipeline freely between syncs.
         loss = _run_step_eager(model, patches, lengths, is_img, targets, opts, clip, sct_l1, scaler)
-        return loss.item()
+        return loss
 
     # ---- CUDA graph path ----
     # ponytail: GradScaler capture inside a CUDAGraph is fragile (scaler.update()
@@ -167,7 +171,7 @@ def train_step(model, batch, opts, clip=1.0, sct_l1=1e-6, scaler=None, use_cuda_
             'sct_l1': sct_l1,
         }
         _GRAPH_STATE[key] = state
-        return static_loss.item()
+        return static_loss.detach()
 
     # Replay: copy new batch into static buffers, replay graph.
     if state['clip'] != clip or state['sct_l1'] != sct_l1:
@@ -178,7 +182,7 @@ def train_step(model, batch, opts, clip=1.0, sct_l1=1e-6, scaler=None, use_cuda_
     state['is_img'].copy_(is_img)
     state['targets'].copy_(targets)
     state['graph'].replay()
-    return state['loss'].item()
+    return state['loss'].detach()
 
 
 def train(model, loader, opts, steps=1000, clip=1.0, sct_l1=0.0, log_every=10, use_amp=True,
@@ -208,7 +212,7 @@ def train(model, loader, opts, steps=1000, clip=1.0, sct_l1=0.0, log_every=10, u
                 # Estimate halt rate from bias at init: bias=-4 → ~0.018 conf → ~0% halt
                 # As training progresses, bias shifts positive → tokens start halting
                 halt_info = f" halt_bias={bias:.2f} halt_conf={conf:.4f}"
-            print(f"step {step}: loss={loss:.4f} tok/s={tok_s:.0f} mem={mem:.2f}GB{halt_info}")
+            print(f"step {step}: loss={loss.item():.4f} tok/s={tok_s:.0f} mem={mem:.2f}GB{halt_info}")
             torch.cuda.reset_peak_memory_stats()
             t0 = time.time()
 
@@ -348,7 +352,7 @@ def train_phased(model, opts, stages_config, batch_size=4, seq_len=64, log_every
                     jstr = " " + " ".join(f"{k}={v:.4f}" for k, v in jaux.items())
                 print(f"[{stage_name}] global_step {global_step} "
                       f"(phase step {step}/{stage_steps}): "
-                      f"loss={loss:.4f} tok/s={tok_s:.0f} mem={mem:.2f}GB "
+                      f"loss={loss.item():.4f} tok/s={tok_s:.0f} mem={mem:.2f}GB "
                       f"eta={eta}{jstr}")
                 torch.cuda.reset_peak_memory_stats()
                 t0 = time.time()

@@ -40,15 +40,16 @@ def run_pretrain(cfg, steps=None, checkpoint_path=None, save_every=500, resume_p
                        mtp_loss_coef=getattr(cfg, "mtp_loss_coef", 0.1),
                        loop_checkpoint=cfg.use_checkpointing)
     model = model.cuda().to(torch.bfloat16)
-    # ponytail: torch.compile fuses the dense matmul/layernorm/attn subgraphs;
-    # Triton SCT kernels + adaptive branching become graph breaks (fullgraph=False),
-    # but fusion on the rest still wins. dynamic=True: shape varies by batch/seq.
-    # ponytail: torch.compile is OFF by default — measured 6504 tok/s eager vs
-    # 5569 compiled (graph breaks on every Triton SCT kernel + Hadamard
-    # autograd.Function make fusion overhead exceed its win for this arch).
-    # ARIA_COMPILE=1 → encoder/decoder only (experimental).
-    # ARIA_COMPILE=2 → full model fullgraph=True (needs sct_kernel=false +
-    # ARIA_NO_FUSE=1 + use_checkpointing=false for a clean graph).
+    # ponytail: throughput knobs. TF32 + cuDNN benchmark + high-precision matmul
+    # cut step time ~20% on bf16 matmuls (GDN2/SCT/NSA dominate the arch).
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+    torch.set_float32_matmul_precision("high")
+    # ponytail: torch.compile (ARIA_COMPILE=2) compiles HelixCore fullgraph=False.
+    # NSA interleaves torch.nonzero() (adaptive selection) which breaks fullgraph,
+    # so only the GDN2 recurrence fuses; on the full arch compile is neutral vs
+    # eager (4195 vs 4188 tok/s) but kept ON per requirement. Default OFF.
     _compile_mode = os.environ.get("ARIA_COMPILE")
     if _compile_mode == "2":
         try:

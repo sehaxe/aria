@@ -72,6 +72,8 @@ class NSAAttention(nn.Module):
                 return flash_attn_func(ql, kl, vl, causal=True)[0].transpose(1, 2)
             except Exception:
                 pass
+        if attn_mask is not None and attn_mask.dtype != q.dtype:
+            attn_mask = attn_mask.to(q.dtype)
         return F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask)
 
     def compress(self, states, mlp, norm):
