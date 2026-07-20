@@ -65,10 +65,6 @@ def _sct_l1(model):
     return sum(m.s.abs().sum() for m in modules)
 
 
-# Per-model graph state. Keyed by id(model) so multiple models can coexist.
-_GRAPH_STATE = {}
-
-
 def _run_step_eager(model, patches, lengths, is_img, targets, opts, clip, sct_l1, scaler):
     for opt in opts:
         opt.zero_grad(set_to_none=True)
@@ -97,104 +93,28 @@ def _run_step_eager(model, patches, lengths, is_img, targets, opts, clip, sct_l1
     return loss
 
 
-def train_step(model, batch, opts, clip=1.0, sct_l1=1e-6, scaler=None, use_cuda_graphs=False):
+def train_step(model, batch, opts, clip=1.0, sct_l1=1e-6, scaler=None):
     patches, lengths, is_img, targets = _unpack_batch(batch)
     patches = patches.cuda(non_blocking=True)
     lengths = lengths.cuda(non_blocking=True)
     is_img = is_img.cuda(non_blocking=True)
     targets = targets.cuda(non_blocking=True)
-
-    if not use_cuda_graphs:
-        # ponytail: return the loss TENSOR, not loss.item(). The .item() call forces a
-        # full GPU sync every step, serializing the pipeline and ~2x-slowing tok/s.
-        # Callers .item() only inside their log block (every log_every steps), so
-        # steps pipeline freely between syncs.
-        loss = _run_step_eager(model, patches, lengths, is_img, targets, opts, clip, sct_l1, scaler)
-        return loss
-
-    # ---- CUDA graph path ----
-    # ponytail: GradScaler capture inside a CUDAGraph is fragile (scaler.update()
-    # touches host state); we require scaler=None for the graph path.
-    if scaler is not None:
-        raise RuntimeError("use_cuda_graphs=True requires scaler=None; "
-                           "bf16 autocast without scaler works, or disable graphs.")
-
-    key = id(model)
-    state = _GRAPH_STATE.get(key)
-
-    if state is None:
-        # Warmup step in a side stream (required before capture per torch docs).
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            _run_step_eager(model, patches, lengths, is_img, targets, opts, clip, sct_l1, None)
-        torch.cuda.current_stream().wait_stream(s)
-        torch.cuda.synchronize()
-
-        # Static input buffers.
-        static_patches = torch.empty_like(patches)
-        static_lengths = torch.empty_like(lengths)
-        static_is_img = torch.empty_like(is_img)
-        static_targets = torch.empty_like(targets)
-        static_patches.copy_(patches)
-        static_lengths.copy_(lengths)
-        static_is_img.copy_(is_img)
-        static_targets.copy_(targets)
-
-        graph = torch.cuda.CUDAGraph()
-        static_loss = torch.empty((), device='cuda')
-
-        with torch.cuda.graph(graph):
-            for opt in opts:
-                opt.zero_grad(set_to_none=False)  # keep grad tensors static
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                loss = model(static_patches, static_lengths, static_is_img, targets=static_targets)
-                if sct_l1 > 0:
-                    l1 = _sct_l1(model)
-                    if l1 is not None:
-                        loss = loss + sct_l1 * l1
-            loss.backward()
-            if clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
-            for opt in opts:
-                opt.step()
-            static_loss.copy_(loss.detach())
-
-        state = {
-            'graph': graph,
-            'patches': static_patches,
-            'lengths': static_lengths,
-            'is_img': static_is_img,
-            'targets': static_targets,
-            'loss': static_loss,
-            'clip': clip,
-            'sct_l1': sct_l1,
-        }
-        _GRAPH_STATE[key] = state
-        return static_loss.detach()
-
-    # Replay: copy new batch into static buffers, replay graph.
-    if state['clip'] != clip or state['sct_l1'] != sct_l1:
-        raise RuntimeError("clip / sct_l1 changed after graph capture; "
-                           "invalidate by deleting the captured graph.")
-    state['patches'].copy_(patches)
-    state['lengths'].copy_(lengths)
-    state['is_img'].copy_(is_img)
-    state['targets'].copy_(targets)
-    state['graph'].replay()
-    return state['loss'].detach()
+    # ponytail: return the loss TENSOR, not loss.item(). The .item() call forces a
+    # full GPU sync every step, serializing the pipeline and ~2x-slowing tok/s.
+    # Callers .item() only inside their log block (every log_every steps), so
+    # steps pipeline freely between syncs.
+    return _run_step_eager(model, patches, lengths, is_img, targets, opts, clip, sct_l1, scaler)
 
 
 def train(model, loader, opts, steps=1000, clip=1.0, sct_l1=0.0, log_every=10, use_amp=True,
-          ema=None, use_cuda_graphs=False):
+          ema=None):
     model.train()
     t0 = time.time()
-    # ponytail: graph path can't wrap a GradScaler; disable amp scaler when graphs on.
-    scaler = torch.amp.GradScaler('cuda', enabled=use_amp) if (use_amp and not use_cuda_graphs) else None
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp) if use_amp else None
     for step, batch in enumerate(loader):
         if step >= steps:
             break
-        loss = train_step(model, batch, opts, clip, sct_l1, scaler, use_cuda_graphs)
+        loss = train_step(model, batch, opts, clip, sct_l1, scaler)
         if ema:
             ema.update(model)
         if step % log_every == 0:
@@ -248,7 +168,7 @@ def _load_ckpt(path, model):
 
 
 def train_phased(model, opts, stages_config, batch_size=4, seq_len=64, log_every=10,
-                 use_amp=True, use_cuda_graphs=False, sct_l1=0.0, default_data_path=None,
+                 use_amp=True, sct_l1=0.0, default_data_path=None,
                  clip=1.0, checkpoint_path=None, save_every=500, resume_path=None, fresh=False):
     """Run declarative multi-stage training with dynamic dataset switching.
 
@@ -259,7 +179,7 @@ def train_phased(model, opts, stages_config, batch_size=4, seq_len=64, log_every
     pre-existing file at `checkpoint_path`) to continue an interrupted run.
     """
     model.train()
-    scaler = torch.amp.GradScaler('cuda', enabled=use_amp) if (use_amp and not use_cuda_graphs) else None
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp) if use_amp else None
     from data.dataset import create_loader
 
     total_steps = sum(s.get("steps", 100) for s in stages_config)
@@ -335,7 +255,7 @@ def train_phased(model, opts, stages_config, batch_size=4, seq_len=64, log_every
         for step in range(start_phase, stage_steps):
             batch = next(loader_iter)
             loss = train_step(model, batch, opts, clip=clip, sct_l1=sct_l1,
-                              scaler=scaler, use_cuda_graphs=use_cuda_graphs)
+                              scaler=scaler)
             if global_step % log_every == 0:
                 elapsed = time.time() - t0
                 dt = elapsed / max(1, log_every)

@@ -1,4 +1,3 @@
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -102,19 +101,15 @@ class HelixCore(nn.Module):
         proj_h = self.u_gate(h)
         # Fused GRU gate + LTI injection in one Triton kernel (saves intermediate
         # HBM round-trips per loop). Keeps the recurrent transition spectrally bound.
-        # ponytail: ARIA_NO_FUSE=1 falls back to the PyTorch reference (debug only).
-        if os.environ.get("ARIA_NO_FUSE") == "1":
-            xr, xz, xn = proj_x.chunk(3, dim=-1)
-            hr, hz, hn = proj_h.chunk(3, dim=-1)
-            r = torch.sigmoid(xr + hr)
-            z = torch.sigmoid(xz + hz)
-            n = torch.tanh(xn + r * hn)
-            h_cand = (1 - z) * n + z * h
-            h_next = self.lti.A_scale * h_cand + self.lti.B_scale * x_encoded
-        else:
-            from kernels.fused_gru_lti import FusedGRULTI
-            h_next = FusedGRULTI.apply(proj_x, proj_h, h, x_encoded,
-                                       self.lti.A_scale, self.lti.B_scale)
+        # ponytail: pure-PyTorch GRU+LTI gate (no custom autograd.Function) so it
+        # fuses under torch.compile fullgraph.
+        xr, xz, xn = proj_x.chunk(3, dim=-1)
+        hr, hz, hn = proj_h.chunk(3, dim=-1)
+        r = torch.sigmoid(xr + hr)
+        z = torch.sigmoid(xz + hz)
+        n = torch.tanh(xn + r * hn)
+        h_cand = (1 - z) * n + z * h
+        h_next = self.lti.A_scale * h_cand + self.lti.B_scale * x_encoded
         halt_prob = torch.sigmoid(self.halt_predictor(h_next))
         return h_next, halt_prob
 

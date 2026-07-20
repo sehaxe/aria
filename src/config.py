@@ -52,7 +52,6 @@ class AriaConfig:
     mtp: bool = True              # Multi-Token Prediction (DeepSeek-V3 style): k heads, 0.5^i decay
     mtp_k: int = 4                # number of future patches predicted (MTP-4)
     mtp_loss_coef: float = 0.1    # weight of the MTP auxiliary loss
-    use_cuda_graph: bool = False  # wrap pretrain step in a CUDAGraph
     use_checkpointing: bool = True  # gradient checkpointing in HelixCore loops
     adaptive_loops: bool = True    # data-dependent early-exit per token (free at init, learns to save)
     kv_cache: bool = False        # cached generation in GRPO rollout
