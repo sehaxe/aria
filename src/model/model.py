@@ -256,5 +256,5 @@ class AriaModel(nn.Module):
             masked = torch.where(is_image_mask[:, k:T].unsqueeze(-1), PAD_ID, tgt)
             ce = F.cross_entropy(logits.reshape(-1, VOCAB_SIZE), masked.reshape(-1),
                                  ignore_index=PAD_ID)
-            total = total + (0.5 ** (k - 1)) * (ce if torch.isfinite(ce) else torch.zeros_like(ce))
+            total = total + (0.5 ** (k - 1)) * torch.where(torch.isfinite(ce), ce, torch.zeros_like(ce))
         return total * self.mtp_loss_coef
