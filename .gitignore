@@ -47,4 +47,5 @@ aria-promo/
 
 # Temp
 *.tmp
+*.log
 .ipynb_checkpoints/

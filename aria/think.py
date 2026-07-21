@@ -172,25 +172,20 @@ _SRC = Path(__file__).resolve().parent
 def build_think_model(config_path=None, checkpoint_path=None, device=None):
     config_path = config_path or str(_SRC.parent / "configs" / "29m.yaml")
     checkpoint_path = checkpoint_path or str(_SRC.parent / "checkpoint.pt")
-    from aria.model.model import AriaModel
-    with open(config_path) as f:
-        cfg = yaml.safe_load(f)
+    from aria.config import AriaConfig
+    from aria.main import build_model
+    cfg = AriaConfig.from_yaml(config_path)
+    cfg.compile = ""  # inference: no torch.compile (eager is fine, avoids warmup)
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    model = AriaModel(
-        d_model=cfg["d_model"], n_heads=cfg["n_heads"], n_loops=cfg["n_loops"],
-        rank=cfg.get("sct_rank", 32),         nsa=cfg.get("nsa", False), nsa_every=cfg.get("nsa_every", 3),
-        window_size=cfg.get("window_size", 512), degree=cfg.get("degree", 6),
-        num_frequencies=cfg.get("num_frequencies", 3), temperature=cfg.get("temperature", 1.0),
-        ponder_lambda=cfg.get("ponder_lambda", 0.01), max_sigma=cfg.get("max_sigma", 1.0),
-        adaptive_loops=cfg.get("adaptive_loops", False),
-        speculative=cfg.get("speculative", True), speculative_k=cfg.get("speculative_k", 4),
-        mtp=cfg.get("mtp", True), mtp_k=cfg.get("mtp_k", 4), mtp_loss_coef=cfg.get("mtp_loss_coef", 0.1),
-        worldmodel_halt=cfg.get("worldmodel_halt", True),
-        compile=False,
-    ).to(device)
+    model = build_model(cfg).to(device)
     if checkpoint_path and os.path.exists(checkpoint_path):
-        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+        sd = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        sd = sd["model"] if isinstance(sd, dict) and "model" in sd else sd
+        # Checkpoints saved from a torch.compile'd run prefix submodules with
+        # `._orig_mod.`; strip it so they load into this eager (non-compiled) model.
+        sd = {k.replace("._orig_mod.", "."): v for k, v in sd.items()}
+        model.load_state_dict(sd)
     else:
         print(f"[Aria] WARNING: checkpoint {checkpoint_path} not found; random init.")
     model.eval()
-    return model, cfg["n_loops"], device
+    return model, cfg.n_loops, device

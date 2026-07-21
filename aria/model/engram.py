@@ -37,8 +37,10 @@ class DeepSeekEngram(nn.Module):
         h1 = compressed % self.engram_vocab_size
         h2 = (compressed[:, :-1] * 31 + compressed[:, 1:]) % self.engram_vocab_size
         h3 = (compressed[:, :-2] * 961 + compressed[:, 1:-1] * 31 + compressed[:, 2:]) % self.engram_vocab_size
-        h2 = F.pad(h2, (1, 0), value=0)
-        h3 = F.pad(h3, (2, 0), value=0)
+        # Left-pad then keep the last T entries — correct for any T (generation
+        # runs T=1, where the raw n-gram slices are shorter than T).
+        h2 = F.pad(h2, (1, 0), value=0)[:, -T:]
+        h3 = F.pad(h3, (2, 0), value=0)[:, -T:]
         stacked = torch.stack([h1, h2, h3][: self.num_heads], dim=-1)
         if stacked.shape[-1] < self.num_heads:
             stacked = F.pad(stacked, (0, self.num_heads - stacked.shape[-1]), value=0)
