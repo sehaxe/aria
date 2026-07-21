@@ -138,7 +138,7 @@ class TrainController:
         return sd.get("step", 0)
 
     def _build_model(self, p):
-        from model.model import AriaModel
+        from aria.model.model import AriaModel
         m = AriaModel(d_model=p["d_model"], n_heads=p["n_heads"], n_loops=p["n_loops"],
                       rank=32,
                       nsa=p.get("nsa", False),
@@ -156,7 +156,7 @@ class TrainController:
         return m.cuda().to(torch.bfloat16)
 
     def _profile_session(self, steps, trace_name):
-        from train.pretrain import create_optimizer
+        from aria.train.pretrain import create_optimizer
         try:
             p = self.params or {"d_model": 768, "n_heads": 12, "n_loops": 6,
                                  "batch_size": 2, "seq_len": 64, "lr_muon": 0.002,
@@ -165,9 +165,9 @@ class TrainController:
             torch.cuda.empty_cache()
             model = self._build_model(p)
             if mode == "grpo":
-                from data.grpo_dataset import GRPOMultimodalDataset, collate_grpo_fn
+                from aria.data.grpo_dataset import GRPOMultimodalDataset, collate_grpo_fn
                 from torch.utils.data import DataLoader
-                from train.grpo import GRPOTrainer
+                from aria.train.grpo import GRPOTrainer
                 ref = self._build_model(p).eval()
                 ref.load_state_dict(model.state_dict())
                 ref.requires_grad_(False)
@@ -182,7 +182,7 @@ class TrainController:
                 def step_fn():
                     return trainer.train_step(next(it), opts, clip=1.0)
             else:
-                from data.dataset import create_loader
+                from aria.data.dataset import create_loader
                 opts = create_optimizer(model, lr_muon=p["lr_muon"], lr_adamw=p["lr_adamw"])
                 loader = create_loader(batch_size=p["batch_size"], seq_len=p["seq_len"],
                                        image_prob=p["image_prob"])
@@ -249,8 +249,8 @@ class TrainController:
                     self.status = "idle"
 
     def _run_pretrain(self, resume):
-        from data.dataset import create_loader
-        from train.pretrain import create_optimizer
+        from aria.data.dataset import create_loader
+        from aria.train.pretrain import create_optimizer
 
         p = self.params
         torch.cuda.empty_cache()
@@ -318,9 +318,9 @@ class TrainController:
         return samples
 
     def _run_grpo(self, resume):
-        from data.grpo_dataset import GRPOMultimodalDataset, collate_grpo_fn
+        from aria.data.grpo_dataset import GRPOMultimodalDataset, collate_grpo_fn
         from torch.utils.data import DataLoader
-        from train.grpo import GRPOTrainer
+        from aria.train.grpo import GRPOTrainer
 
         p = self.params
         torch.cuda.empty_cache()

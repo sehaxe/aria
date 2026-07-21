@@ -55,6 +55,7 @@ class AriaConfig:
     use_checkpointing: bool = True  # gradient checkpointing in HelixCore loops
     adaptive_loops: bool = True    # data-dependent early-exit per token (free at init, learns to save)
     kv_cache: bool = False        # cached generation in GRPO rollout
+    compile: str = "helix"        # torch.compile target: "helix" fuses the GDN2 recurrence; "" disables
     # --- Aria-JEPA (I-JEPA masked latent prediction + Semantic Tube Prediction) ---
     jepa: bool = False
     jepa_pred_hidden: int = 1024

@@ -1,7 +1,7 @@
 """Aria Control Room — Textual TUI for training & recurrent thinking.
 
 Gradio-free dashboard driving train.controller.TrainController and (lazily)
-the thinking path from think.py. Live loss / tok-s sparklines, a breathing
+the thinking path from aria.think.py. Live loss / tok-s sparklines, a breathing
 status badge, and a thinking-depth meter.
 
 Tabs:
@@ -16,7 +16,7 @@ Bindings: q=quit, s=start, p=pause/resume toggle, x=stop.
 import sys
 from pathlib import Path
 
-# ponytail: src/ layout — put src/ on path so `from train.controller import ...`
+# ponytail: src/ layout — put src/ on path so `from aria.train.controller import ...`
 # works whether launched as `python src/tui.py` or `python -m tui`.
 _SRC = Path(__file__).resolve().parent
 if str(_SRC) not in sys.path:
@@ -40,7 +40,7 @@ from textual.widgets import (
     TabPane,
 )
 
-from train.controller import TrainController
+from aria.train.controller import TrainController
 
 
 CONFIG_PATH = str(_SRC.parent / "configs" / "29m.yaml")
@@ -434,7 +434,7 @@ class AriaTUI(App):
         out.write(f"[dim]> {prompt}[/dim]")
         out.write("[dim]loading model (first run may be slow)…[/dim]")
         try:
-            from think import build_think_model, generate
+            from aria.think import build_think_model, generate
             model, loops, device = build_think_model()
             pairs = generate(model, prompt, max_new_bytes=max_len, temp=temp,
                              max_loops=loops, device=device)

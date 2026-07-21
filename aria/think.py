@@ -4,7 +4,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 import yaml
-from spectral_tta import spectral_tta_step, restore_spectral_tta
+from aria.spectral_tta import spectral_tta_step, restore_spectral_tta
 
 PAD_ID = 268
 MAX_PATCH_LEN = 16
@@ -172,7 +172,7 @@ _SRC = Path(__file__).resolve().parent
 def build_think_model(config_path=None, checkpoint_path=None, device=None):
     config_path = config_path or str(_SRC.parent / "configs" / "29m.yaml")
     checkpoint_path = checkpoint_path or str(_SRC.parent / "checkpoint.pt")
-    from model.model import AriaModel
+    from aria.model.model import AriaModel
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")

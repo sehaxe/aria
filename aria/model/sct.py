@@ -1,5 +1,5 @@
 import torch, torch.nn as nn, math, torch.nn.functional as F
-from bitnet_v2 import hadamard, _dequant, _pack_int4
+from aria.bitnet_v2 import hadamard, _dequant, _pack_int4
 
 def _ternary_quant(w, ternary=True):
     """Ternary/linear quant of SCT factors with STE.
@@ -84,7 +84,7 @@ class SCTLinear(nn.Module):
 
 def _bitnet_act_deq(x, bits, use_hadamard, dtype):
     """BitNet activation quant → dequantized float (compile-friendly, STE)."""
-    from bitnet_v2 import _bitnet_act_quant
+    from aria.bitnet_v2 import _bitnet_act_quant
     return _bitnet_act_quant(x, bits, use_hadamard).to(dtype)
 
 

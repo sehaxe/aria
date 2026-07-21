@@ -8,8 +8,8 @@ from .lti_injection import LTIInjection
 from .loop_ln import LoopModulatedLN
 from .sct import SCTLinear
 from .engram import DeepSeekEngram
-from mask import combined_mask
-from bitnet_v2 import bitnet_int_codes, _dequant, hadamard
+from aria.mask import combined_mask
+from aria.bitnet_v2 import bitnet_int_codes, _dequant, hadamard
 
 
 class HelixCore(nn.Module):
@@ -128,7 +128,7 @@ class HelixCore(nn.Module):
         # ponytail: full BitNet — quantize the input activation ONCE at the source
         # so the raw bf16 x is freed; every loop consumer gets the dequantized act.
         if self.bitnet_v2:
-            from bitnet_v2 import bitnet_quantize_act
+            from aria.bitnet_v2 import bitnet_quantize_act
             x_encoded = bitnet_quantize_act(x, self.bitnet_act_bits, self.bitnet_hadamard)
         else:
             x_encoded = x

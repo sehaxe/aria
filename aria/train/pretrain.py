@@ -1,5 +1,5 @@
 import os, time, torch
-from optim.hymopt import Muon
+from aria.optim.hymopt import Muon
 
 def create_optimizer(model, lr_muon=2e-3, lr_adamw=3e-4, wd_muon=0.1, wd_adamw=0.01,
                      lotus_rank=32, engram_only=False):
@@ -53,7 +53,7 @@ def _unpack_batch(batch):
 
 
 def _sct_l1(model):
-    from model.sct import SCTLinear
+    from aria.model.sct import SCTLinear
     # Cache the SCTLinear list on first use (it's stable for the model's lifetime);
     # rescanning model.modules() every training step is pure overhead.
     modules = getattr(model, "_sct_modules", None)
@@ -180,7 +180,7 @@ def train_phased(model, opts, stages_config, batch_size=4, seq_len=64, log_every
     """
     model.train()
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp) if use_amp else None
-    from data.dataset import create_loader
+    from aria.data.dataset import create_loader
 
     total_steps = sum(s.get("steps", 100) for s in stages_config)
 
